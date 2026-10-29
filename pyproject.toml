@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opener-tools"
+version = "0.1.0"
+description = "Host tools for the Opener DECT NR+ stack: Spinel client, sniffer"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "src/opener_tools/spinel/NOTICE"]
+requires-python = ">=3.11"
+dependencies = ["pyserial>=3.5"]
+
+[project.optional-dependencies]
+spi = ["spidev", "gpiod>=2"]
+hub = ["aiohttp>=3.9"]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "hw: needs hardware (--transport)",
+    "simdev: needs OPENER_SIMDEV_EXE",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Vendored from pyspinel, kept close to upstream.
+"src/opener_tools/spinel/codec.py" = ["I", "UP", "B", "F841"]
+"src/opener_tools/spinel/const.py" = ["UP"]
+
+[tool.ruff.format]
+# Vendored from pyspinel, kept in upstream formatting.
+exclude = ["src/opener_tools/spinel/codec.py", "src/opener_tools/spinel/const.py"]
