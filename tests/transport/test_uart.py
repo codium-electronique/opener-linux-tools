@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from opener_tools.spinel import hdlc_encode
+from opener_tools.spinel import HdlcDecoder, hdlc_encode
 from opener_tools.transport import TransportClosed, UartTransport
 
 TIMEOUT = 1.0
@@ -56,6 +56,36 @@ async def test_send_writes_hdlc_frame(pty):
     async with UartTransport(name) as transport:
         await asyncio.wait_for(transport.send(frame), TIMEOUT)
         assert await read_master(master, len(expected)) == expected
+
+
+async def read_frames(master, count):
+    decoder = HdlcDecoder(1 << 20)
+    frames = []
+    deadline = asyncio.get_running_loop().time() + TIMEOUT
+    while len(frames) < count:
+        assert asyncio.get_running_loop().time() < deadline, (
+            f"got {len(frames)} frames, {decoder.errors} errors"
+        )
+        try:
+            data = os.read(master, 4096)
+        except BlockingIOError:
+            await asyncio.sleep(0.001)
+            continue
+        frames += decoder.feed(data)
+    assert decoder.errors == 0
+    return frames
+
+
+async def test_concurrent_sends_do_not_interleave(pty):
+    master, name = pty
+    # Larger than the pty buffer: each send blocks part-way through.
+    first = bytes([0x11]) * 20000
+    second = bytes([0x22]) * 20000
+    async with UartTransport(name, max_frame=len(first)) as transport:
+        sends = asyncio.gather(transport.send(first), transport.send(second))
+        frames = await read_frames(master, 2)
+        await asyncio.wait_for(sends, TIMEOUT)
+        assert sorted(frames) == [first, second]
 
 
 async def test_garbage_before_frame_counts_error(pty):

@@ -28,6 +28,9 @@ class UartTransport(Transport):
         self._decoder = HdlcDecoder(max_frame)
         self._serial = None
         self._frames = asyncio.Queue()
+        # A frame is written in several parts when the port buffer fills:
+        # one sender at a time, or frames interleave on the wire.
+        self._send_lock = asyncio.Lock()
         self._closed = True
 
     @property
@@ -53,13 +56,14 @@ class UartTransport(Transport):
             raise TransportClosed(self.path)
         fd = self._serial.fileno()
         data = memoryview(hdlc_encode(frame))
-        while data:
-            try:
-                written = os.write(fd, data)
-            except BlockingIOError:
-                await self._writable(fd)
-                continue
-            data = data[written:]
+        async with self._send_lock:
+            while data:
+                try:
+                    written = os.write(fd, data)
+                except BlockingIOError:
+                    await self._writable(fd)
+                    continue
+                data = data[written:]
 
     async def recv(self) -> bytes:
         if self._closed and self._frames.empty():
