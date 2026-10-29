@@ -1,14 +1,16 @@
 # Spinel M2 — host-driven NR+ sniffer over UART: Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `nrp-sniffer`, a Python tool that drives the `dectnrp-spinel` firmware to capture DECT NR+ frames into a `DLT_DECT_NR_TAP` (304) pcap, also usable as a Wireshark extcap. Validated end to end on a DK capturing a `dectnrp-driver` peer.
+**Execution mode:** the same as plan 1. Claude implements task by task and never commits. At each "Commit" step it gives the commit command(s) with the `Co-Authored-By` trailer and waits for the user's approval.
+
+**Goal:** `nrp-sniffer`, a Python tool that drives the `dectnrp-spinel` firmware to capture DECT NR+ frames into a `DLT_DECT_NR_TAP` (304) pcap, also usable as a Wireshark extcap. Validated end to end on an nRF9131EK capturing a `dectnrp-driver` peer.
 
 **Architecture:** `RxPipeline` keeps `depth` scheduled RX windows queued on the modem and yields received and error events. `capture/` turns each event into a DECT-NR-TAP record and writes pcap. The `nrp-sniffer` CLI wires the two together, both as a plain CLI and in extcap mode. Everything is built on plan 1's `Radio` API.
 
 **Tech Stack:** Python ≥ 3.11 asyncio, pytest, the native_sim simdev from plan 1, Wireshark/tshark ≥ 4.7.4 for decode checks.
 
-**Spec:** `linux-tools/docs/specs/2026-10-28-opener-spinel-design.md` §6.3–6.5, §7, §8.3.2. Depends on plan 1 (`2026-10-28-spinel-m1-foundation.md`) being complete, and on its Task 1 probe results.
+**Spec:** `linux-tools/docs/specs/2026-10-28-opener-spinel-design.md` §6.3–6.5, §7, §8.3.2. Depends on plan 1 (`2026-10-28-spinel-m1-foundation.md`) being complete, and on the probe results from its Tasks 1 and 2.
 
 ## Global Constraints
 
@@ -25,9 +27,10 @@
 - pcap: classic little-endian µs header `struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 304)`, as in the Deveritec writer. Timestamps are host time.
 - Defaults:
   - channel 1677 and network ID 0x32545279 (`dectnrp-driver` sample values, not Deveritec's);
-  - window 20 ms (RX is single-shot, so a received frame ends its window early and the remaining window time is uncovered; short windows bound that gap);
+  - RX reception mode and window: **decided in plan 1 Task 2 step 4.** The planned outcome is semi-continuous with 500 ms windows if the probe shows it receives every `dectnrp-driver` frame (type 2 format 0, which continuous mode cannot receive). Otherwise single-shot with 20 ms windows: a received frame ends a single-shot window early, and short windows bound the uncovered remainder. Below, `DEFAULT_RX_MODE` / `DEFAULT_WINDOW_MS` stand for the decided values, defined once in `cli/sniffer.py`;
   - depth 4;
-  - lead = the minimum lead measured in plan 1 Task 1(d) plus 5 ms (use 20 ms if the probe was not more precise).
+  - lead 20 ms. The probe found that 1 ms is accepted; the 20 ms covers host and link latency. Lead is clamped to at least `caps.sched_op_startup + caps.rx_startup`.
+  - Window spacing: consecutive windows are separated by `caps.sched_op_transition` (D11; 25 920 ticks = 375 µs on nRF9131). Exactly adjacent windows are rejected by the modem (plan 1 Task 1). If the device reports 0 (unknown), use 1 ms.
 - Deveritec attribution: `capture/tap.py` and `capture/extcap.py` carry `# Derived from Deveritec dectnrp-sniffer (Apache-2.0), opener-samples deveritec/dectnrp-sniffer:samples/dectnrp-sniffer/`.
 
 ## Review Focus
@@ -52,28 +55,30 @@
   - `@dataclass(frozen=True) class Gap: start: int; length: int; reason: str` (`"resync"`, `"rejected"`, `"reset"`).
   - `@dataclass class PipelineStats: windows: int = 0; early_finishes: int = 0; gaps: int = 0; gap_ticks: int = 0`.
   - `class RxPipeline`:
-    - `__init__(self, radio: Radio, channel: int, window_ms: float = 20, depth: int = 4, lead_ms: float = 20)`. Raises `ValueError` if `depth > radio.caps.op_slots`.
+    - `__init__(self, radio: Radio, channel: int, window_ms: float, depth: int = 4, lead_ms: float = 20, reception: Reception = Reception.SINGLE_SHOT)`. Raises `ValueError` if `depth > radio.caps.op_slots`. Every window is scheduled with `reception`.
     - `stats: PipelineStats`;
     - `def __aiter__(self) -> AsyncIterator[MsgReceived | MsgError | Gap]`;
     - `async def stop(self) -> None`: no new windows; awaits the in-flight ops (they finish within one window); idempotent.
 - Algorithm (the part the signature does not fix):
   - Sync: `t0 = await radio.time()`, record `host0 = time.monotonic()`; `now_est() = t0 + (monotonic() − host0) · ticks_per_ms · 1000`.
-  - First start = `t0 + lead`. Schedule `depth` windows back to back: `start(k+1) = start(k) + window`.
+  - First start = `t0 + lead`. Schedule `depth` windows back to back: `start(k+1) = start(k) + window + transition`, where `transition = caps.sched_op_transition or ms_to_ticks(1)`.
   - On each `OpFinished`, schedule one more window at `next_start`. If `next_start < now_est() + lead / 2`, resync first: `new = await radio.time() + lead`, yield `Gap(next_start, new − next_start, "resync")`, set `next_start = new`, and re-anchor `now_est`.
   - A `SpinelError` on insert → the same resync with reason `"rejected"`, then retry once. A second failure re-raises.
-  - An `OpFinished` whose window received a frame before its end (the op's events contain a `MsgReceived`) increments `early_finishes`. That is expected (single-shot RX), not a gap.
+  - In single-shot mode, an `OpFinished` whose window received a frame (the op's events contain a `MsgReceived`) increments `early_finishes`. That is expected, not a gap.
   - Events are yielded in arrival order. `DeviceReset` propagates to the caller.
 
 - [ ] **Step 1: Write the failing tests.** `FakeRadio` has a virtual modem clock the test advances. `schedule_rx` records `(start, duration)` and returns an Op the test finishes. `time()` returns the clock.
-  - `test_back_to_back`: depth 3, window 20 ms. The first 3 starts are `t0+lead`, `+window`, `+2·window`. Finishing op 1 schedules a 4th at `t0+lead+3·window`.
+  - `test_back_to_back`: depth 3, window 20 ms, `sched_op_transition` 25920. The starts are `t0+lead+k·(window+25920)` for k = 0..2. Finishing op 1 schedules a 4th at k = 3.
+  - `test_unknown_transition`: `sched_op_transition` 0 → spacing is `window + 69120` (1 ms).
   - `test_yields_events_in_order`: `MsgReceived` and `MsgError` injected on different ops come out in injection order.
   - `test_resync_on_late`: advance the clock 1 s past the queued windows before finishing an op. The next item is a `Gap(reason="resync")` whose `start` equals the old `next_start`, and the new window starts at `clock + lead`.
   - `test_resync_on_reject`: `schedule_rx` raises `SpinelError` once → `Gap(reason="rejected")`, then scheduling continues.
   - `test_double_reject_raises`: two consecutive rejects → `SpinelError` propagates.
+  - `test_reception_passed`: `reception=Reception.SEMICONTINUOUS` → every `schedule_rx` call gets it.
   - `test_early_finish_counted`: an op with a `MsgReceived` then `OpFinished` → `stats.early_finishes == 1`, no `Gap`.
   - `test_stop_drains`: `stop()` returns once all in-flight ops are finished, and nothing new is scheduled after `stop()`.
   - `test_depth_exceeds_slots`: `depth=9` with `op_slots=8` → `ValueError`.
-- [ ] **Step 2: Run, expect FAIL**: `.venv/bin/pytest tests/dectnrp/test_pipeline.py -v`
+- [ ] **Step 2: Run, expect FAIL**: `../.venv/bin/pytest tests/dectnrp/test_pipeline.py -v`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run, expect PASS.**
 - [ ] **Step 5: Commit** `feat: add RxPipeline for gapless scheduled reception`.
@@ -153,10 +158,10 @@
 - Consumes: `open_transport`, `SpinelClient`, `Radio`, `RxPipeline`, `build_tap_record`, `PcapWriter`.
 - Produces:
   - `def main(argv: list[str] | None = None) -> int`;
-  - `async def run_sniffer(transport_url: str, out: BinaryIO, channel: int, network_id: int, window_ms: float, depth: int, lead_ms: float, stop: asyncio.Event, log: logging.Logger) -> SnifferStats`;
+  - `async def run_sniffer(transport_url: str, out: BinaryIO, channel: int, network_id: int, reception: Reception, window_ms: float, depth: int, lead_ms: float, stop: asyncio.Event, log: logging.Logger) -> SnifferStats`;
   - `@dataclass SnifferStats: records, crc_errors, dropped_events, gaps, gap_ms, resets`.
 - CLI:
-  - `--transport URL` (required unless extcap), `--channel` (1677), `--network-id` (int, base auto, 0x32545279), `--window` ms (20), `--depth` (4), `--lead` ms (20), `-w FILE|-` (default `-` = stdout, `flush_each=True` for `-` and FIFOs), `-v`.
+  - `--transport URL` (required unless extcap), `--channel` (1677), `--network-id` (int, base auto, 0x32545279), `--rx-mode single|semi|continuous` (`DEFAULT_RX_MODE`), `--window` ms (`DEFAULT_WINDOW_MS`), `--depth` (4), `--lead` ms (20), `-w FILE|-` (default `-` = stdout, `flush_each=True` for `-` and FIFOs), `-v`.
   - Logs go to stderr. Stats are printed to stderr at exit.
   - SIGINT/SIGTERM set `stop`.
 - Flow:
@@ -189,7 +194,7 @@
 - Extcap protocol as in the Deveritec `dectnrp_sniffer_extcap.py`:
   - `--extcap-interfaces` lists `extcap {version=<pkg version>}` and `interface {value=nrp-sniffer}{display=DECT NR+ Sniffer (Opener Spinel)}`.
   - `--extcap-dlts` prints `dlt {number=304}{name=DECT_NR_TAP}{display=DECT NR+ TAP}`.
-  - `--extcap-config` offers args `--transport` (string, default `uart:///dev/ttyACM0`), `--channel` (unsigned, 1677), `--network-id` (string, `0x32545279`), `--window` (unsigned, 20), `--depth` (unsigned, 4).
+  - `--extcap-config` offers args `--transport` (string, default `uart:///dev/ttyACM0`), `--channel` (unsigned, 1677), `--network-id` (string, `0x32545279`), `--rx-mode` (selector single/semi/continuous, default `DEFAULT_RX_MODE`), `--window` (unsigned, `DEFAULT_WINDOW_MS`), `--depth` (unsigned, 4).
   - `--capture --fifo PATH` runs `run_sniffer` writing to the FIFO.
   - `--extcap-version`, `--extcap-interface` and `--extcap-capture-filter` are accepted (the filter is ignored).
 - `install-extcap.sh`: symlinks a wrapper script running `<venv>/bin/nrp-sniffer "$@"` into `~/.local/lib/wireshark/extcap/` (or `$1`), then `chmod +x`.
@@ -209,19 +214,19 @@
 - Create: `tools:tests/integration/test_sniffer_simdev.py`
 
 - [ ] **Step 1: Write the tests** (marker `simdev`, plan 1 fixture `simdev_url`):
-  - `test_sniffer_captures`: `run_sniffer` for 3 s, with window 20 ms and depth 4, writing to a temp file. The simdev emits a frame every 100 ms into active windows, so expect ≥ 20 records, about 10 % of them with data type 3, and every data type 1 body ending with `b"Hello World!"`. `stats.gaps == 0`.
+  - `test_sniffer_captures`: `run_sniffer` for 3 s, with the default mode and window and depth 4, writing to a temp file. The simdev emits a type 2 frame every 100 ms into active windows, so expect ≥ 20 records, about 10 % of them with data type 4, and every data type 2 body ending with `b"Hello World!"`. `stats.gaps == 0`.
   - `test_tshark_decodes`: skipped unless tshark ≥ 4.7.4 (parse `tshark --version`). `tshark -r file -Y dect_nr_tap -T fields -e dect_nr_tap.tlv_element.modem_time` gives one non-zero value per record, which checks the LO/HI order end to end.
-- [ ] **Step 2: Run**: `OPENER_SIMDEV_EXE=… .venv/bin/pytest -m simdev -v`. Expect PASS. Debug any failure with superpowers:systematic-debugging.
+- [ ] **Step 2: Run**: `OPENER_SIMDEV_EXE=… ../.venv/bin/pytest -m simdev -v`. Expect PASS. Debug any failure with superpowers:systematic-debugging.
 - [ ] **Step 3: Commit** `test: sniffer integration against simulated device`.
 
-### Task 7: Hardware validation on DKs (§8.3.2) and docs
+### Task 7: Hardware validation on EKs (§8.3.2) and docs
 
 **Files:**
 - Create: `tools:docs/nrp-sniffer.md` (usage: CLI, extcap install, Wireshark ≥ 4.7.4 note, defaults and the single-shot window note)
 - Modify: `tools:README.md` (tool list, install, test commands)
 
-- [ ] **Step 1: Set up the DKs.** Device1 runs `dectnrp-spinel` (plan 1 Task 14), Device2 runs `dectnrp-driver` with default settings.
+- [ ] **Step 1: Set up the EKs.** Device1 runs `dectnrp-spinel` (plan 1 Task 15), Device2 runs `dectnrp-driver` with default settings.
 - [ ] **Step 2: Capture.** Run `nrp-sniffer --transport uart:///dev/ttyACM<n> -w /tmp/dk.pcap` for 60 s, then Ctrl-C. Expect about 20 records (Device2 sends every 3 s; ping-pong with no peer means TX only), exit code 0, and stats with 0 dropped events.
-- [ ] **Step 3: Decode in Wireshark.** Open the capture in Wireshark 4.7.4 (local build): records decode as DECT NR+ with the PCC fields and the `Hello World!` payload, and the modem time is present. Screenshot or note the result for the user.
-- [ ] **Step 4: Run as extcap.** Install with `scripts/install-extcap.sh`, then start a live capture from the Wireshark GUI; stopping the capture leaves the DK disabled (check `nrp-sniffer` has exited and the RTT log shows `stop`).
+- [ ] **Step 3: Decode in Wireshark.** Open the capture in Wireshark 4.7.4 (local build): records decode as DECT NR+ with the type 2 PCC fields and the `Hello World!` payload in the MAC PDU, and the modem time is present. Screenshot or note the result for the user.
+- [ ] **Step 4: Run as extcap.** Install with `scripts/install-extcap.sh`, then start a live capture from the Wireshark GUI; stopping the capture leaves Device1 disabled (check `nrp-sniffer` has exited and the RTT log shows `stop`).
 - [ ] **Step 5: Commit** `docs: add nrp-sniffer usage` in linux-tools. Report the results to the user and ask whether to write plan 3 (SPI on the NR+Gate).

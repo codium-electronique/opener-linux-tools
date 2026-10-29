@@ -24,7 +24,9 @@ Success criteria:
 - `nrp-ping` running against the NR+Gate is seen by `dectnrp-driver` DKs as a peer: they log `SYNCHRONIZED` and print the received `Hello World!` payload; the host receives their frames.
 - Device and host automated tests run without hardware (native_sim + pty).
 
-Out of scope: MAC/DLC/CVG Spinel levels; on-device monitoring of layers not owned by Spinel; any changes to the nRF91 driver beyond bug fixes found on the way (a continuous-RX driver mode is a possible later improvement).
+The D9 and D11 driver changes are made on a separate opener branch `driver-rx-mode` as independent commits, so they can go upstream without the Spinel subsystem; `spinel-ctrl` is rebased onto them.
+
+Out of scope: MAC/DLC/CVG Spinel levels; on-device monitoring of layers not owned by Spinel; changes to the driver beyond (a) bug fixes found on the way and (b) one minimal addition, an **RX reception mode** in the driver API (single-shot, semi-continuous, continuous) mapped to the nRF91 modem modes (D9).
 
 ## 2. Key decisions
 
@@ -38,6 +40,9 @@ Out of scope: MAC/DLC/CVG Spinel levels; on-device monitoring of layers not owne
 | D6 | Host transports: `uart`, `spi`, `tcp`. Tools run either on the gateway (SPI) or on a PC (TCP through `nrp-hub`, or UART to a DK). | One code path for all setups. |
 | D7 | `nrp-hub` owns the link: **one exclusive controller** (Unix socket or TCP), plus **read-only monitors** (TCP tap and web UI websocket) seeing all frames in both directions. Monitors can never inject. | Remote debugging over the gateway's Wi-Fi AP without control conflicts. |
 | D8 | `nrp-hub` speaks only raw Spinel frames to clients, so it can be rewritten (e.g. in Go) without touching tools if profiling ever requires it. | Keeps the performance escape hatch cheap. |
+| D9 | The driver API gains an RX reception mode (`struct dectnrp_rx_mode.reception`: single-shot = 0, the default and current behaviour; semi-continuous; continuous), exposed in `DRV_OP_QUEUE` flags. The nRF91 driver maps it to `NRF_MODEM_DECT_PHY_RX_MODE_*` and keeps per-message RX state, so one op can deliver several frames. | Single-shot RX ends a window at the first frame, so the rest of the window is not listened to. Continuous RX closes that gap, but the modem cannot receive PHY header type 2 format 0 in continuous mode, and that is the format `dectnrp-driver` sends. Semi-continuous only stops on a unicast PDC. Which mode the sniffer uses by default is decided by the hardware probe (§8.3). |
+| D11 | The driver API reports **modem latencies** through `get_capabilities()`, in modem ticks and vendor-neutral terms: the minimum transition between scheduled ops, the extra startup for scheduled ops, and the RX and TX startup latencies. The nRF91 driver keeps the values `nrf_modem_dect_phy_latency_get()` returns at init for its active radio mode. They are exposed in `DRV_CAPS`. | Measured on nRF9131 (LOW_LATENCY mode): back-to-back scheduled ops are rejected (`OP_SCHEDULING_CONFLICT`) unless spaced by `scheduled_operation_transition` (25 920 ticks, 375 µs). A host can only schedule correctly if it knows this value. |
+| D10 | At driver level (`CONFIG_DECTNRP_SPINEL_LEVEL_DRIVER`, and only then) the Spinel interface **registers the DECTNRP L2 itself**; otherwise the application provides it, as the samples do today: the L2 is implemented on the host, and the device never provides one in this configuration. Future Spinel levels on top of a device L2 will not do this; that is not anticipated now. | The driver needs an L2 hook (`dectnrp_l2_init`), and currently only the samples define one. |
 
 ## 3. Architecture
 
@@ -62,7 +67,7 @@ Opener fork (`opener-samples/deps/dectnrp-opener`), all built only with `CONFIG_
 
 | Path | Content |
 |---|---|
-| `subsys/spinel/` | core (dispatch, property table, op broker, event forwarding) |
+| `subsys/spinel/` | core (dispatch, property table, op broker, event forwarding) and the driver-level DECTNRP L2 registration (D10) |
 | `subsys/spinel/transport/uart_hdlc.c`, `spi.c` | transports |
 | `subsys/spinel/lib/spinel.c`, `spinel.h`, `LICENSE` | vendored OpenThread codec, original BSD-3 header kept, upstream commit recorded |
 | `include/zephyr/net/dectnrp_spinel.h` | DECT NR+ property / command / capability / status IDs — **single source of truth** |
@@ -127,7 +132,7 @@ All multi-byte integers are Spinel little-endian types; `d` is Spinel length-pre
 | Property | ID | Access | Spinel format | Maps to |
 |---|---|---|---|---|
 | `DRV_ENABLED` | `0x3D00` | get/set | `b` | `start()` / `stop()` |
-| `DRV_CAPS` | `0x3D01` | get | see below | `get_hw_capabilities()`, RDCAP Kconfig values |
+| `DRV_CAPS` | `0x3D01` | get | see below | `get_capabilities()` (hw caps, latencies), RDCAP Kconfig values |
 | `DRV_TIME` | `0x3D02` | get | `X` (u64) | `get_time()` |
 | `DRV_NETWORK_ID` | `0x3D03` | get/set | `L` | `configure(NETWORK_ID)` |
 | `DRV_FILTER_SHORT_NWID` | `0x3D04` | get/set | `bC` (active, value) | `configure(FILTER_SHORT_NETWORK_ID)` |
@@ -136,7 +141,7 @@ All multi-byte integers are Spinel little-endian types; `d` is Spinel length-pre
 | `DRV_EVENT` | `0x3D11` | async stream | see §4.6 | driver event callback |
 | `DRV_STATS` | `0x3D20` | get | see below | counters |
 
-`DRV_CAPS` (`L` hw_caps bitmask, then `C` release, `C` power class max, `C` NSS RX max, `C` RX/TX diversity max, `c` RX gain dB, `C` MCS max, `L` soft buffer size, `C` HARQ processes max, `C` HARQ feedback delay, `C` mu max, `C` beta max, `L` modem ticks per symbol, `S` max frame size, `C` op slots). Getters return the values most recently set (filters, network ID).
+`DRV_CAPS` (`L` hw_caps bitmask, then `C` release, `C` power class max, `C` NSS RX max, `C` RX/TX diversity max, `c` RX gain dB, `C` MCS max, `L` soft buffer size, `C` HARQ processes max, `C` HARQ feedback delay, `C` mu max, `C` beta max, `L` modem ticks per symbol, `S` max frame size, `C` op slots, then the D11 latencies in modem ticks: `L` scheduled-op transition, `L` scheduled-op startup, `L` RX startup, `L` TX startup). Getters return the values most recently set (filters, network ID).
 
 `DRV_STATS` (`L` each): ops accepted, ops rejected, events sent, events dropped, frames received from host, frames rejected (parse/CRC), transport errors.
 
@@ -144,7 +149,7 @@ All multi-byte integers are Spinel little-endian types; `d` is Spinel length-pre
 
 Common prefix: `S token` (host-chosen, unique among in-flight ops), `C type` (0 TX, 1 RX, 2 RSSI1), `S channel`, `C flags`, `X start_time` (modem ticks; used only if `is_scheduled`).
 
-`flags` bits: 0 `is_scheduled`, 1 `is_lbt` (TX), 2 `is_harq` (TX), 3 `is_beacon` (TX/RX).
+`flags` bits: 0 `is_scheduled`, 1 `is_lbt` (TX), 2 `is_harq` (TX), 3 `is_beacon` (TX/RX), 5..4 RX reception mode (RX only: 0 single-shot, 1 semi-continuous, 2 continuous; 3 → `INVALID_ARGUMENT`; must be 0 for TX/RSSI1).
 
 Type-specific suffix:
 
@@ -232,7 +237,7 @@ Vendored pyspinel subset: codec (`encode_fields` / `parse_fields`, packed uint),
 - `Radio(client)`: `reset()`, `enable(bool)`, `caps()`, `time()`, `set_network_id()`, `set_filter_*()`, `stats()`, `schedule_rx()`, `schedule_tx()`, `schedule_rssi1()`, `events()` (async iterator of all events).
 - `schedule_*()` allocate a token and return an `Op`, an awaitable that completes on `OP_FINISHED` and exposes the events received for that token.
 - Timing helpers derived from `DRV_CAPS`: modem ticks per symbol / subslot / slot / frame; ms ↔ ticks.
-- `RxPipeline(radio, channel, window, depth=3)`: reads `DRV_TIME`, schedules `depth` RX windows back to back (`start = previous start + duration`), schedules a new one on each `OP_FINISHED`, and yields received / error events. If the device rejects an op or a window would start in the past, it resyncs from `DRV_TIME` and reports the coverage gap (start, length).
+- `RxPipeline(radio, channel, window, depth=3, reception=…)`: reads `DRV_TIME`, schedules `depth` RX windows back to back (`start = previous start + duration + scheduled-op transition`), schedules a new one on each `OP_FINISHED`, and yields received / error events. If the device rejects an op or a window would start in the past, it resyncs from `DRV_TIME` and reports the coverage gap (start, length).
 
 ### 6.4 Capture (`capture/`)
 
@@ -240,7 +245,7 @@ DECT NR TAP record builder and libpcap writer (link type 304), derived from the 
 
 ### 6.5 Tools
 
-- **`nrp-sniffer`**: `--transport URL`, `--channel`, `--network-id`, `--window` (ms), `--depth`, `-w FILE|-`; also usable as a Wireshark extcap (`--extcap-interfaces`, `--capture`, `--fifo`, …). Flow: reset → set network ID → enable → `RxPipeline` → TAP/pcap. Ctrl-C/SIGTERM: stop scheduling, wait for outstanding ops, disable. Prints stats (records, CRC errors, dropped events, coverage gaps).
+- **`nrp-sniffer`**: `--transport URL`, `--channel`, `--network-id`, `--rx-mode single|semi|continuous`, `--window` (ms), `--depth`, `-w FILE|-`; also usable as a Wireshark extcap (`--extcap-interfaces`, `--capture`, `--fifo`, …). Flow: reset → set network ID → enable → `RxPipeline` → TAP/pcap. Ctrl-C/SIGTERM: stop scheduling, wait for outstanding ops, disable. Prints stats (records, CRC errors, dropped events, coverage gaps).
 - **`nrp-ping`**: reproduces `samples/dectnrp-driver` behaviour (`src/main.c`, `src/dectnrp_mac_helper.c`): same network ID default, random short ID, same PCC type / transport parameters / `Hello World!` payload, unsynchronised RX-then-TX period (`--period`, default 3000 ms), synchronisation to a peer from the `start_time` of its received frame (TX at period/2 offset), fallback to unsynchronised when nothing is received. PCC field helpers ported from `dectnrp_mac_helper.c`.
 - **`nrp-hub`**: owns one transport of any type (systemd unit on the NR+Gate with `spi://…`; also usable on a PC with a DK over `uart://…`).
   - Control: Unix socket and TCP port (default 4950); one controller at a time, others refused. Frames are relayed unchanged in both directions. On controller disconnect, the hub sends `CMD_RESET` so the next controller starts clean.
@@ -274,7 +279,7 @@ DECT NR TAP record builder and libpcap writer (link type 304), derived from the 
 
 ### 8.3 Hardware validation
 
-1. Risk probe (first): on a DK, schedule 3 RX windows back to back at modem time; confirm all accepted and executed without gaps. If the modem rejects queued ops, revisit D2 (fallback: continuous-RX driver mode).
+1. Risk probe (first): on a DK, schedule 3 RX windows back to back at modem time; confirm all accepted and executed without gaps. If the modem rejects queued ops, revisit D2. After the D9 driver change, repeat with each reception mode against a `dectnrp-driver` peer (type 2 format 0 frames) to choose the sniffer's default mode and window.
 2. DK over UART: smoke (reset, caps, time, enable); `nrp-sniffer` captures a second DK running `dectnrp-driver`; Wireshark 4.7.4 decodes the capture.
 3. NR+Gate over SPI: same sniffer locally on the gateway, then from a PC through `nrp-hub` over TCP, with the web UI monitoring.
 4. `nrp-ping` on the NR+Gate ↔ DK running `dectnrp-driver`: DK logs `SYNCHRONIZED` and the `Hello World!` payload; host receives the DK's frames.
@@ -297,4 +302,5 @@ DECT NR TAP record builder and libpcap writer (link type 304), derived from the 
 
 - `PROP_INTERFACE_TYPE` value for DECT NR+ (`0x4E52` proposed) and `PROP_VENDOR_ID`.
 - Vendor range split (§4.3) as the Opener-wide allocation for future levels.
-- Whether the driver API should gain a continuous-RX mode (not needed by this design).
+- The RX reception mode (D9), the latencies in device capabilities (D11) and the nRF91 RX-state fix, as driver-API change proposals.
+- Running the Spinel ztests: they run in opener-samples' CI (opener is not a west workspace); to be discussed with the community.
