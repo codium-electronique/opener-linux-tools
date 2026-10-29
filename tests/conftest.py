@@ -12,6 +12,11 @@ def pytest_addoption(parser):
         default=None,
         help="device transport URL for hardware tests, e.g. uart:///dev/ttyACM0?baud=1000000",
     )
+    parser.addoption(
+        "--peer",
+        action="store_true",
+        help="a dectnrp-driver device transmits on channel 1677 during the hardware tests",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
