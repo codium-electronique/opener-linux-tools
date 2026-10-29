@@ -14,6 +14,9 @@ from opener_tools.spinel.dectnrp_constants import Reception
 pytestmark = pytest.mark.hw
 
 PEER_WINDOW_MS = 5000
+# CONFIG_DECTNRP_SAMPLE_NETWORK_ID of dectnrp-driver: the PDC does not decode
+# with another network ID.
+PEER_NETWORK_ID = 0x32545279
 PEER_TIMEOUT = 8.0
 
 
@@ -50,6 +53,7 @@ async def test_rx_from_peer(request, radio):
     # reception ends on them, so use single shot windows. Each one ends on
     # its first frame, which may fail or come from another transmitter: keep
     # opening windows for PEER_WINDOW_MS.
+    await radio.set_network_id(PEER_NETWORK_ID)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + PEER_WINDOW_MS / 1000
     frames = []
