@@ -24,6 +24,11 @@ HEADER_IID_MASK = 0x30
 HEADER_TID_MASK = 0x0F
 TID_COUNT = 15
 
+# Requests waiting for a reply: the device holds
+# CONFIG_DECTNRP_SPINEL_RX_BUFS (4 by default) frames from the host and drops
+# the frames received while all are in use.
+MAX_IN_FLIGHT = 4
+
 # The device waits up to CONFIG_DECTNRP_SPINEL_RESET_TIMEOUT_MS (1 s by
 # default) for the operations in flight before it answers CMD_RESET.
 RESET_TIMEOUT = 2.0
@@ -121,14 +126,18 @@ class SpinelClient:
 
     Requests use TIDs 1 to 15; a TID is not reused while its request is
     pending, nor for `timeout` seconds after it timed out, so a late reply
-    cannot answer a newer request. Unsolicited frames (TID 0) go to every
+    cannot answer a newer request. At most `max_in_flight` requests wait for
+    a reply at once; the others wait for a TID. Unsolicited frames (TID 0) go to every
     subscriber queue. An unsolicited reset fails the pending requests with
     DeviceReset and calls the on_reset callbacks.
     """
 
-    def __init__(self, transport: Transport, timeout: float = 1.0):
+    def __init__(
+        self, transport: Transport, timeout: float = 1.0, max_in_flight: int = MAX_IN_FLIGHT
+    ):
         self.transport = transport
         self.timeout = timeout
+        self.max_in_flight = max_in_flight
         self.on_reset: list[Callable[[int], None]] = []
         self._pending: dict[int, asyncio.Future[SpinelFrame]] = {}
         self._quarantine: dict[int, float] = {}
@@ -229,6 +238,8 @@ class SpinelClient:
         return reply.value
 
     def _free_tid(self) -> int | None:
+        if len(self._pending) >= self.max_in_flight:
+            return None
         now = asyncio.get_running_loop().time()
         for _ in range(TID_COUNT):
             tid = self._next_tid

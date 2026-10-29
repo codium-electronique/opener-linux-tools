@@ -10,6 +10,7 @@ from fakes import FakeTransport
 from opener_tools.spinel import SPINEL, SpinelCodec
 from opener_tools.spinel import dectnrp_constants as nrp
 from opener_tools.spinel.client import (
+    MAX_IN_FLIGHT,
     DeviceReset,
     SpinelClient,
     SpinelError,
@@ -161,6 +162,22 @@ async def test_concurrent_requests(client, fake):
 
     values = await asyncio.gather(*gets)
     assert values == [SpinelCodec.encode_i(prop) for prop in props]
+
+
+async def test_in_flight_limit(client, fake):
+    props = [nrp.PROP_DRV_ENABLED + i for i in range(MAX_IN_FLIGHT + 2)]
+    gets = [asyncio.create_task(client.get(prop)) for prop in props]
+    await asyncio.sleep(TIMEOUT / 10)
+
+    assert fake.sent.qsize() == MAX_IN_FLIGHT
+
+    await answer_next(fake, b"")
+    await asyncio.sleep(TIMEOUT / 10)
+
+    assert fake.sent.qsize() == MAX_IN_FLIGHT
+    for get in gets:
+        get.cancel()
+    await asyncio.gather(*gets, return_exceptions=True)
 
 
 async def test_unsolicited_fanout(client, fake):
