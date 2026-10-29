@@ -82,3 +82,11 @@ class EventCode(IntEnum):
     MSG_ERROR = EVENT_MSG_ERROR
     OP_RESULTS = EVENT_OP_RESULTS
     OP_FINISHED = EVENT_OP_FINISHED
+
+
+class Reception(IntEnum):
+    """RX reception mode, DRV_OP_QUEUE flag bits 5..4 (enum dectnrp_rx_reception)."""
+
+    SINGLE_SHOT = 0
+    SEMICONTINUOUS = 1
+    CONTINUOUS = 2
