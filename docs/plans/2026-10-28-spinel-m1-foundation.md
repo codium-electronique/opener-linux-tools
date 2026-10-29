@@ -35,7 +35,7 @@
 - Spinel formats (exact):
   - Op prefix `SCSCX`. Suffixes: TX `CSCCCCLCd`, RX `LC`, RSSI1 `L`.
   - Event prefix `SClS`. Suffixes: MSG_RECEIVED `CCXCcSdd`, MSG_ERROR `CCXCcSd`, OP_RESULTS `Sd`, OP_FINISHED none.
-  - `DRV_CAPS` `LCCCCcCLCCCCLSCLLLL`, `DRV_STATS` `LLLLLLL`, filters `bC` / `bS`.
+  - `DRV_CAPS` `LCCCCcCLCCCCLSCLLLLLLLL`, `DRV_STATS` `LLLLLLL`, filters `bC` / `bS`.
 - Spinel frame header byte = `0x80 | tid`; requests use TID 1–15, unsolicited frames TID 0.
 - Modem time: 69 120 ticks/ms, 2880 ticks/symbol (nRF91), frame = 10 ms = 691 200 ticks (`DECTNRP_SUBSLOTS_PER_FRAME` 48 × 5 symbols).
 - Test hardware: two **nRF9131EK** boards (PCA10165, NR+ PHY modem firmware already flashed, board target `nrf9131ek/nrf9131/ns`).
@@ -106,13 +106,16 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `enum dectnrp_rx_reception { DECTNRP_RX_RECEPTION_SINGLE_SHOT = 0, DECTNRP_RX_RECEPTION_SEMICONTINUOUS = 1, DECTNRP_RX_RECEPTION_CONTINUOUS = 2 };`
   - `struct dectnrp_rx_mode` gains `uint8_t reception: 2;`. The doc comment states that 0 keeps today's behaviour, and that nRF91 continuous mode cannot receive PHY header type 2 format 0 (`nrf_modem_dect_phy.h`).
   - nRF91 maps it to `rx_params.mode` = `NRF_MODEM_DECT_PHY_RX_MODE_SINGLE_SHOT` / `_SEMICONTINUOUS` / `_CONTINUOUS`.
-- Commit C, the latencies (D11). `struct dectnrp_device_capabilities` gains four fields, each documented as "in modem ticks":
-  - `uint32_t sched_op_transition`: minimum time between the end of a scheduled operation and the start of the next one;
-  - `uint32_t sched_op_startup`: extra startup latency for scheduled operations;
-  - `uint32_t rx_startup`: idle to RF on, for RX;
-  - `uint32_t tx_startup`: idle to RF on, for TX.
+- Commit C, the latencies (D11). `struct dectnrp_device_capabilities` gains eight `uint32_t` fields, in modem ticks (the unit of the whole driver API, see `DECTNRP_MODEMTICKS_PER_SYMBOL`), 0 if unknown (extended with the user after review: shutdown and stop latencies added; units stay ticks):
+  - `sched_op_transition`: minimum time between the end of a scheduled operation and the start of the next one;
+  - `sched_op_startup`: extra startup latency for scheduled operations;
+  - `rx_startup` (idle to RF on, RX and RSSI1), `rx_shutdown` (RF off to idle after RX), `rssi_shutdown` (after RSSI1);
+  - `tx_startup`, `tx_shutdown`;
+  - `stop_to_rf_off`: stop request to RF off.
   
-  The nRF91 driver copies `radio_mode[NRF_MODEM_DECT_PHY_RADIO_MODE_LOW_LATENCY].scheduled_operation_transition` / `.scheduled_operation_startup` and `operation.receive.idle_to_active` / `operation.transmit.idle_to_active` into its context in `modem_latency_get_cb`, using the radio mode it activates in `nrf91x1_start`, and `nrf91x1_get_capabilities` returns them. Fields stay 0 for drivers that do not know them, which callers treat as "unknown".
+  Not exposed: RX-with-RSSI end latency (never requested by the driver), radio mode transitions (one mode only) and stack init/activation latencies (internal to `start()`/`stop()`). The commit also fixes the `get_time()` doc comment (a tick is 1/69 120 000 s, not 1/691 200 s).
+  
+  The nRF91 driver copies `radio_mode[NRF91X1_RADIO_MODE].scheduled_operation_transition` / `.scheduled_operation_startup`, `operation.receive.idle_to_active` / `.active_to_idle_rx` / `.active_to_idle_rssi` / `.stop_to_rf_off` and `operation.transmit.idle_to_active` / `.active_to_idle` into its context in `modem_latency_get_cb`, using the radio mode it activates in `nrf91x1_start`, and `nrf91x1_get_capabilities` returns them. Fields stay 0 for drivers that do not know them, which callers treat as "unknown".
 
 - [ ] **Step 1: Create the branch and extend the probe.** Run `git -C deps/dectnrp-opener switch -c driver-rx-mode main`. Add round C to the probe: for each reception mode, one immediate RX window of 10 s on 1677, while Device2 runs `dectnrp-driver` (one type 2 format 0 frame every 3 s). Log the number of `MSG_RECEIVED`/`MSG_ERROR` events and the `OP_FINISHED` time. Until commit B exists, round C sets the modem mode with a probe-local `#ifdef` hack in the driver, which is reverted before committing.
 - [ ] **Step 2: Reproduce the bug on the unmodified driver.** Run round C in semi-continuous mode through the hack. Expect at most 1 frame per op (the second PCC is dropped as an "overrun"). Then check the stale-PCC case: the log shows `PHY_EVT_PCC overrun` after a window that ended between a PCC and its PDC, if the probe can provoke one.
@@ -123,13 +126,17 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - continuous → expected 0 type 2 format 0 frames. Record what actually happens.
   
   Re-run the `dectnrp-driver` regression. **Decide with the user** the sniffer default: semi-continuous with 500 ms windows if it receives every frame, otherwise single-shot with 20 ms windows. Write the decision into plan 2's Global Constraints. **Stop for commit B**: `drivers: dectnrp: add RX reception mode to the driver API`.
+
+  **Done (commits A `0ca7a29`, B `d6e04fa`).** Round C, 15 s immediate windows: format 0 unicast → single-shot 1, semi-continuous 1 (ends on any unicast PDC, whatever its receiver), continuous 0; format 1 unicast (throwaway peer) → continuous 5/5; type 1 broadcast → continuous 5/5; reception 3 → `-EINVAL`. **Decision (user): sniffer default single-shot, 20 ms windows, window size configurable**, recorded in plan 2 Global Constraints.
 - [ ] **Step 4b: Commit C.**
   - Implement the latencies.
   - Extend the probe: log `get_capabilities()`, and add a round of 4 × 50 ms windows spaced by exactly `sched_op_transition`.
-  - Expect the logged values to be 25 920 / 0 / 24 192 / (TX value) on nRF9131, all 4 windows to run, and round G0 (0 gap) to still fail.
+  - Expect the logged values to match the latencies measured in Task 1 on nRF9131, all 4 windows to run, and round G0 (0 gap) to still fail.
   - Re-run the `dectnrp-driver` regression.
   
   **Stop for commit C**: `drivers: dectnrp: report modem latencies in device capabilities`.
+
+  **Result:** nRF9131 LOW_LATENCY reports `sched_op_transition` 25 920, `sched_op_startup` 0, `rx_startup` 24 192, `rx_shutdown` 12 441, `rssi_shutdown` 13 824, `tx_startup` 29 030, `tx_shutdown` 7 603, `stop_to_rf_off` 14 169 ticks. 4 × 50 ms windows spaced by exactly the transition all run (spacing 1 tick shorter is also accepted); gap 0 still fails with 0x1004 then 0x1005.
 - [ ] **Step 5: Rebase.** After the user has committed A, B and C: run `git -C deps/dectnrp-opener switch spinel-ctrl && git -C deps/dectnrp-opener rebase driver-rx-mode`. Confirm that `git log --oneline main..spinel-ctrl` shows A, B and C. Pushing `driver-rx-mode` and `spinel-ctrl` to `origin` is for the user to do.
 
 ### Task 3: Opener — subsystem skeleton, vendored codec, ID header
@@ -227,7 +234,7 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `struct net_if *mock_driver_iface(void)`;
   - `void mock_driver_emit(const struct dectnrp_driver_event *evt)`, which calls `cb(iface, evt)`.
 
-  `stop()` emits `OP_FINISHED` for every recorded op still unfinished, matching nRF91 cancel-all. `get_time` returns `time` when non-zero, else `k_uptime_get() * 69120`. `get_hw_capabilities` returns `DECTNRP_HW_FILTER | DECTNRP_HW_TXTIME | DECTNRP_HW_RXTIME`, and `get_capabilities` returns the same `hw_caps` with the nRF9131 latencies (transition 25920, sched startup 0, RX startup 24192, TX startup 24192). Created with `NET_DEVICE_INIT(…, DECTNRP_L2, NET_L2_GET_CTX_TYPE(DECTNRP_L2), DECTNRP_MTU)`, and `iface_api.init` calls `dectnrp_l2_init()` like the nRF91 driver.
+  `stop()` emits `OP_FINISHED` for every recorded op still unfinished, matching nRF91 cancel-all. `get_time` returns `time` when non-zero, else `k_uptime_get() * 69120`. `get_hw_capabilities` returns `DECTNRP_HW_FILTER | DECTNRP_HW_TXTIME | DECTNRP_HW_RXTIME`, and `get_capabilities` returns the same `hw_caps` with the nRF9131 latencies (25920, 0, 24192, 12441, 13824, 29030, 7603, 14169 in field order). Created with `NET_DEVICE_INIT(…, DECTNRP_L2, NET_L2_GET_CTX_TYPE(DECTNRP_L2), DECTNRP_MTU)`, and `iface_api.init` calls `dectnrp_l2_init()` like the nRF91 driver.
 
 - [ ] **Step 1: Write the failing tests** (`ZTEST_SUITE(spinel_mock)`):
   - `test_iface_found`: `net_if_get_first_by_type(&NET_L2_GET_NAME(DECTNRP)) == mock_driver_iface()`.
@@ -268,7 +275,7 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
     - `VENDOR_ID` `i` 0;
     - `CAPS` = packed `i` list `[CAP_DECTNRP_DRV]`;
     - `LAST_STATUS` get → OK.
-  - Driver props (§4.4). `DRV_ENABLED` set calls `start`/`stop`, treating `-EALREADY` as success, and replies `IS` with the new state. The filter/network-ID getters return the cached last-set values (initial: 0, inactive). `DRV_CAPS` packs, in order: `get_capabilities().hw_caps`; the `CONFIG_DECTNRP_DRIVER_RDCAP_*` values; `CONFIG_DECTNRP_DRIVER_MODEMTICKS_PER_SYMBOL`; `CONFIG_DECTNRP_SPINEL_MAX_FRAME_SIZE`; `CONFIG_DECTNRP_SPINEL_OP_SLOTS`; then `sched_op_transition`, `sched_op_startup`, `rx_startup`, `tx_startup` from `get_capabilities()`.
+  - Driver props (§4.4). `DRV_ENABLED` set calls `start`/`stop`, treating `-EALREADY` as success, and replies `IS` with the new state. The filter/network-ID getters return the cached last-set values (initial: 0, inactive). `DRV_CAPS` packs, in order: `get_capabilities().hw_caps`; the `CONFIG_DECTNRP_DRIVER_RDCAP_*` values; `CONFIG_DECTNRP_DRIVER_MODEMTICKS_PER_SYMBOL`; `CONFIG_DECTNRP_SPINEL_MAX_FRAME_SIZE`; `CONFIG_DECTNRP_SPINEL_OP_SLOTS`; then the eight latencies from `get_capabilities()` in struct order (`sched_op_transition`, `sched_op_startup`, `rx_startup`, `rx_shutdown`, `rssi_shutdown`, `tx_startup`, `tx_shutdown`, `stop_to_rf_off`).
 
 - [ ] **Step 1: Write the failing tests** (`ZTEST_SUITE(spinel_core)`; the `before` hook calls `mock_driver_reset()` and drains `spinel_test_recv`). Helpers `send_req(tid, cmd, prop, fmt, …)` and `recv_reply(&tid, &cmd, &prop, &payload, &len)` use `spinel_datatype_pack/unpack`.
   - `test_boot_reset_notification`: the first frame ever received is TID 0 `PROP_VALUE_IS LAST_STATUS RESET_POWER_ON`. This suite must run first; name it `test_00_…`.
@@ -280,7 +287,7 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `test_network_id_roundtrip`: set 0x32545279 → `mock->network_id == 0x32545279`, get returns it.
   - `test_filters`: set `DRV_FILTER_SHORT_NWID` (true, 0x79) and `DRV_FILTER_SHORT_RXADDR` (true, 0xBEEF) → mock fields set, getters match.
   - `test_time`: `mock->time = 123456789` → get `X` returns it.
-  - `test_caps_layout`: the unpacked `DRV_CAPS` give hw_caps = 0x904, ticks/symbol 2880, max frame 1300, op slots 8, rxgain −4, transition 25920, sched startup 0, RX startup 24192, TX startup 24192.
+  - `test_caps_layout`: the unpacked `DRV_CAPS` give hw_caps = 0x904, ticks/symbol 2880, max frame 1300, op slots 8, rxgain −4, latencies 25920, 0, 24192, 12441, 13824, 29030, 7603, 14169 in field order.
   - `test_unknown_prop`: get 0x3DFF → `LAST_STATUS PROP_NOT_FOUND`, same TID.
   - `test_unknown_cmd`: cmd 0x7F → `INVALID_COMMAND`.
   - `test_truncated_set`: set `DRV_NETWORK_ID` with a 2-byte value → `PARSE_ERROR`.
@@ -509,7 +516,7 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   Also `def decode_event(value: bytes) -> Event`, with an unknown code → `ValueError`.
 - `timing.py`: `@dataclass(frozen=True) class Timing: ticks_per_symbol: int`, with properties `ticks_per_subslot` (×5), `ticks_per_slot` (×10), `ticks_per_frame` (×240) and `ticks_per_ms` (`ticks_per_frame // 10`), plus methods `ms_to_ticks(ms: float) -> int` and `ticks_to_ms(t: int) -> float`.
 - `radio.py`:
-  - `@dataclass DrvCaps` (fields in §4.4 order: `hw_caps, release, power_class, nss_rx, diversity, rx_gain_db, mcs_max, soft_buffer, harq_max, harq_delay, mu_max, beta_max, ticks_per_symbol, max_frame, op_slots, sched_op_transition, sched_op_startup, rx_startup, tx_startup`; property `timing -> Timing`).
+  - `@dataclass DrvCaps` (fields in §4.4 order: `hw_caps, release, power_class, nss_rx, diversity, rx_gain_db, mcs_max, soft_buffer, harq_max, harq_delay, mu_max, beta_max, ticks_per_symbol, max_frame, op_slots, sched_op_transition, sched_op_startup, rx_startup, rx_shutdown, rssi_shutdown, tx_startup, tx_shutdown, stop_to_rf_off`; property `timing -> Timing`).
   - `@dataclass DrvStats` (`ops_accepted, ops_rejected, events_sent, events_dropped, frames_rx, frames_rejected, transport_errors`).
   - `@dataclass TxParams(phy_header_type: int, tbs: int, mu: int, beta: int, mcs: int, slots: int, lbt_period: int = 0, lbt_rssi_threshold: int = 0)`.
   - `class Op` (awaitable; `token: int`; `events: list[Event]`; `done: bool`; `def __await__` resolves to the `OpFinished`; raises `DeviceReset` if a reset intervenes).

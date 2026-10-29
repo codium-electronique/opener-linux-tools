@@ -27,7 +27,7 @@
 - pcap: classic little-endian µs header `struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 304)`, as in the Deveritec writer. Timestamps are host time.
 - Defaults:
   - channel 1677 and network ID 0x32545279 (`dectnrp-driver` sample values, not Deveritec's);
-  - RX reception mode and window: **decided in plan 1 Task 2 step 4.** The planned outcome is semi-continuous with 500 ms windows if the probe shows it receives every `dectnrp-driver` frame (type 2 format 0, which continuous mode cannot receive). Otherwise single-shot with 20 ms windows: a received frame ends a single-shot window early, and short windows bound the uncovered remainder. Below, `DEFAULT_RX_MODE` / `DEFAULT_WINDOW_MS` stand for the decided values, defined once in `cli/sniffer.py`;
+  - RX reception mode and window (decided with the user after plan 1 Task 2): **single-shot, 20 ms windows** by default. On nRF91, continuous mode cannot receive type 2 format 0 (all current `dectnrp-driver` traffic), and semi-continuous ends on any unicast frame, so only single-shot sees every format. A received frame ends a single-shot window early, and short windows bound the uncovered remainder. The window size must stay **configurable** (`--window`, fractional ms accepted, CLI and extcap) so shorter or longer windows can be tested easily; `--rx-mode continuous` remains available for broadcast/format 1 captures. `DEFAULT_RX_MODE = Reception.SINGLE_SHOT` and `DEFAULT_WINDOW_MS = 20.0` are defined once in `cli/sniffer.py`;
   - depth 4;
   - lead 20 ms. The probe found that 1 ms is accepted; the 20 ms covers host and link latency. Lead is clamped to at least `caps.sched_op_startup + caps.rx_startup`.
   - Window spacing: consecutive windows are separated by `caps.sched_op_transition` (D11; 25 920 ticks = 375 µs on nRF9131). Exactly adjacent windows are rejected by the modem (plan 1 Task 1). If the device reports 0 (unknown), use 1 ms.
@@ -161,7 +161,7 @@
   - `async def run_sniffer(transport_url: str, out: BinaryIO, channel: int, network_id: int, reception: Reception, window_ms: float, depth: int, lead_ms: float, stop: asyncio.Event, log: logging.Logger) -> SnifferStats`;
   - `@dataclass SnifferStats: records, crc_errors, dropped_events, gaps, gap_ms, resets`.
 - CLI:
-  - `--transport URL` (required unless extcap), `--channel` (1677), `--network-id` (int, base auto, 0x32545279), `--rx-mode single|semi|continuous` (`DEFAULT_RX_MODE`), `--window` ms (`DEFAULT_WINDOW_MS`), `--depth` (4), `--lead` ms (20), `-w FILE|-` (default `-` = stdout, `flush_each=True` for `-` and FIFOs), `-v`.
+  - `--transport URL` (required unless extcap), `--channel` (1677), `--network-id` (int, base auto, 0x32545279), `--rx-mode single|semi|continuous` (`DEFAULT_RX_MODE`), `--window` ms (float > 0, `DEFAULT_WINDOW_MS`; argparse error otherwise), `--depth` (4), `--lead` ms (20), `-w FILE|-` (default `-` = stdout, `flush_each=True` for `-` and FIFOs), `-v`.
   - Logs go to stderr. Stats are printed to stderr at exit.
   - SIGINT/SIGTERM set `stop`.
 - Flow:
@@ -178,6 +178,7 @@
   - `test_clean_stop`: set `stop` → the last requests are no further inserts and `SET DRV_ENABLED false`; the return happens after all ops finished; the file is closed.
   - `test_broken_pipe_is_clean`: the writer raises `BrokenPipeError` → `run_sniffer` returns normally and the radio is disabled.
   - `test_cli_args`: `main(["--transport","fake://","-w",tmp,"--network-id","0x1234"])` parses the hex value, and the exit code is 0 after stop.
+  - `test_window_option`: `--window 5` and `--window 0.5` give inserted RX durations of 5 ms and 0.5 ms (in ticks); `--window 0` and `--window -1` exit with an argparse error (code 2). Without `--window`, the duration is 20 ms and the flags carry single-shot.
 - [ ] **Step 2: Run, expect FAIL.**
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run, expect PASS.**
@@ -194,7 +195,7 @@
 - Extcap protocol as in the Deveritec `dectnrp_sniffer_extcap.py`:
   - `--extcap-interfaces` lists `extcap {version=<pkg version>}` and `interface {value=nrp-sniffer}{display=DECT NR+ Sniffer (Opener Spinel)}`.
   - `--extcap-dlts` prints `dlt {number=304}{name=DECT_NR_TAP}{display=DECT NR+ TAP}`.
-  - `--extcap-config` offers args `--transport` (string, default `uart:///dev/ttyACM0`), `--channel` (unsigned, 1677), `--network-id` (string, `0x32545279`), `--rx-mode` (selector single/semi/continuous, default `DEFAULT_RX_MODE`), `--window` (unsigned, `DEFAULT_WINDOW_MS`), `--depth` (unsigned, 4).
+  - `--extcap-config` offers args `--transport` (string, default `uart:///dev/ttyACM0`), `--channel` (unsigned, 1677), `--network-id` (string, `0x32545279`), `--rx-mode` (selector single/semi/continuous, default `DEFAULT_RX_MODE`), `--window` (double, `DEFAULT_WINDOW_MS`), `--depth` (unsigned, 4).
   - `--capture --fifo PATH` runs `run_sniffer` writing to the FIFO.
   - `--extcap-version`, `--extcap-interface` and `--extcap-capture-filter` are accepted (the filter is ignored).
 - `install-extcap.sh`: symlinks a wrapper script running `<venv>/bin/nrp-sniffer "$@"` into `~/.local/lib/wireshark/extcap/` (or `$1`), then `chmod +x`.
