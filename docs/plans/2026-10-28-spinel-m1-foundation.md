@@ -171,7 +171,7 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `DECTNRP_SPINEL_RX_VALID_{RSSI2,SNR,PCC}` = `BIT(0..2)`;
   - the format strings as `#define DECTNRP_SPINEL_FMT_*` (`OP_PREFIX "SCSCX"`, `OP_TX`, `OP_RX`, `OP_RSSI1`, `EVT_PREFIX "SClS"`, `EVT_MSG_RECEIVED`, `EVT_MSG_ERROR`, `EVT_OP_RESULTS`, `DRV_CAPS`, `DRV_STATS`).
   
-  Every ID has a one-line doc comment citing the spec section.
+  Every ID has a one-line doc comment. No reference to the spec (it is not in the opener repo) nor to `doc/spinel.rst` (it lands in Task 9).
 
 - [ ] **Step 1: Vendor the codec.** Fetch `spinel.c`/`spinel.h` from `https://raw.githubusercontent.com/openthread/openthread/3d645eb9106cb1d5c2ff11891e84dc14e52e293a/src/lib/spinel/`, unmodified. Add `LICENSE`, OpenThread's BSD-3 text. Add `README.rst` stating origin, commit and "do not modify; update by re-vendoring". Add `.clang-format` containing `DisableFormat: true` and `SortIncludes: Never`, so the CI clang-format check skips these files. Build it as a `zephyr_library_named(dectnrp_spinel)` with `zephyr_library_include_directories(lib)`.
 - [ ] **Step 2: Write the failing codec test** (`ZTEST_SUITE(spinel_codec)`):
@@ -399,6 +399,7 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `main.c` logs a banner and returns.
   - `sample.yaml` scenario `sample.dectnrp_spinel` on `nrf9151dk/nrf9151/ns`.
 - `doc/spinel.rst`: §4 of the spec turned into reference documentation: framing, identity, ranges, property table, op and event layouts, the reset/OP_FINISHED guarantee. Also the DK quick start, and the deviation notes (IRQ polarity and BUSY are documented in plan 3).
+- `dectnrp_spinel.h`: once `doc/spinel.rst` exists, the file comment points to it as the protocol reference.
 
 - [ ] **Step 1: Build both targets, expect PASS**: `west build -p -b nrf9151dk/nrf9151/ns -d build/nrf9151dk/nrf9151/ns/dectnrp-spinel samples/dectnrp-spinel`, and the same with `nrf9131ek/nrf9131/ns` into `build/nrf9131ek/nrf9131/ns/dectnrp-spinel`. Check that `build/.../zephyr/.config` has `CONFIG_DECTNRP_SPINEL_TRANSPORT_UART=y` .
 - [ ] **Step 2: Build the docs, expect no new warnings** (command in CLAUDE.md "Building the stack's docs").
