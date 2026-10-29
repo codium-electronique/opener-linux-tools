@@ -4,10 +4,14 @@
 """Test doubles."""
 
 import asyncio
-from collections.abc import Callable
+import dataclasses
+from collections.abc import AsyncIterator, Callable
 
+from opener_tools.dectnrp import DrvCaps, Event, Op, OpFinished
 from opener_tools.spinel import SPINEL, SpinelCodec
 from opener_tools.spinel import dectnrp_constants as nrp
+from opener_tools.spinel.client import DeviceReset, SpinelError
+from opener_tools.spinel.dectnrp_constants import Reception
 from opener_tools.transport import Transport, TransportClosed
 
 
@@ -130,3 +134,82 @@ class ScriptedDevice:
                 self.transport.inject(frame)
         reply = SpinelCodec.encode_fields("S", token)
         self.transport.inject(make_frame(tid, SPINEL.RSP_PROP_VALUE_INSERTED, prop, reply))
+
+
+def make_caps(**fields: int) -> DrvCaps:
+    """DrvCaps with every field 0 but ticks_per_symbol 2880 and op_slots 8,
+    overridden by fields."""
+    values = {field.name: 0 for field in dataclasses.fields(DrvCaps)}
+    values["ticks_per_symbol"] = 2880
+    values["op_slots"] = 8
+    values.update(fields)
+    return DrvCaps(**values)
+
+
+class FakeRadio:
+    """Radio double with a virtual modem clock the test advances.
+
+    schedule_rx records (op, start, duration, reception) in scheduled and
+    returns an Op the test feeds with emit() and finish(). It raises
+    SpinelError while reject is non-zero, decrementing it.
+    """
+
+    def __init__(self, caps: DrvCaps):
+        self.caps = caps
+        self.clock = 0
+        self.reject = 0
+        self.scheduled: list[tuple[Op, int | None, int, Reception]] = []
+        self._next_token = 1
+        self._pending: dict[int, Op] = {}
+        self._streams: list[asyncio.Queue[Event]] = []
+
+    async def time(self) -> int:
+        return self.clock
+
+    async def schedule_rx(
+        self,
+        channel: int,
+        duration: int,
+        start: int | None = None,
+        reception: Reception = Reception.SINGLE_SHOT,
+    ) -> Op:
+        if self.reject > 0:
+            self.reject -= 1
+            raise SpinelError(SPINEL.STATUS_FAILURE)
+        token = self._next_token
+        self._next_token += 1
+        op = Op(token)
+        self._pending[token] = op
+        self.scheduled.append((op, start, duration, reception))
+        return op
+
+    def events(self) -> AsyncIterator[Event]:
+        queue: asyncio.Queue[Event] = asyncio.Queue()
+        self._streams.append(queue)
+        return self._stream(queue)
+
+    def emit(self, event: Event) -> None:
+        op = self._pending.get(event.token)
+        if op is not None:
+            if isinstance(event, OpFinished):
+                del self._pending[event.token]
+            op._add(event)
+        for queue in self._streams:
+            queue.put_nowait(event)
+
+    def finish(self, op: Op) -> None:
+        self.emit(OpFinished(op.token, 0, 0))
+
+    def device_reset(self, status: int = SPINEL.STATUS_RESET_POWER_ON) -> None:
+        ops = list(self._pending.values())
+        self._pending.clear()
+        for op in ops:
+            op._fail(DeviceReset(status))
+
+    async def _stream(self, queue: asyncio.Queue[Event]) -> AsyncIterator[Event]:
+        try:
+            while True:
+                event = await queue.get()
+                yield event
+        finally:
+            self._streams.remove(queue)
