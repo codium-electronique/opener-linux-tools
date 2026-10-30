@@ -146,7 +146,9 @@ class SpinelClient:
         self._next_tid = 1
         self._tid_released = asyncio.Condition()
         self._subscribers: list[asyncio.Queue[SpinelFrame]] = []
-        self._reset_waiter: asyncio.Future[int] | None = None
+        # TID of the NOOP that ends reset(), None outside reset().
+        self._reset_fence: int | None = None
+        self._reset_seen = False
         self._reader: asyncio.Task | None = None
 
     async def start(self) -> None:
@@ -179,15 +181,16 @@ class SpinelClient:
         frame = SpinelCodec.encode_packet(cmd, payload + value, tid=HEADER_FLAG | tid)
 
         try:
-            await self.transport.send(frame)
-            reply = await asyncio.wait_for(future, self.timeout)
+            # Sending is bounded too: a device that never takes the frame
+            # (BUSY stuck, no Spinel firmware) must not hang the caller.
+            async with asyncio.timeout(self.timeout):
+                await self.transport.send(frame)
+                reply = await future
         except TimeoutError:
             self._quarantine[tid] = loop.time() + self.timeout
             raise SpinelTimeout(f"no reply to command {cmd} (TID {tid})") from None
         finally:
-            del self._pending[tid]
-            async with self._tid_released:
-                self._tid_released.notify()
+            await self._release_tid(tid)
 
         status = reply.status()
         if status is not None and status != SPINEL.STATUS_OK:
@@ -210,19 +213,33 @@ class SpinelClient:
         """Send CMD_RESET and wait for the RESET_* notification.
 
         The device answers with TID 0 whatever the request TID, so the
-        command goes out with TID 0 too.
+        command goes out with TID 0 too, followed by a NOOP: the device
+        handles frames in order, so the NOOP reply comes after the
+        notification. The reset statuses received until then belong to this
+        reset, also a stale one, such as the boot notification an SPI device
+        keeps armed until a host clocks it.
         """
+        tid = await self._acquire_tid()
         loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        self._reset_waiter = future
-        frame = SpinelCodec.encode_packet(SPINEL.CMD_RESET, tid=HEADER_FLAG)
+        fence = loop.create_future()
+        self._pending[tid] = fence
+        self._reset_fence = tid
+        self._reset_seen = False
+        reset = SpinelCodec.encode_packet(SPINEL.CMD_RESET, tid=HEADER_FLAG)
+        noop = SpinelCodec.encode_packet(SPINEL.CMD_NOOP, tid=HEADER_FLAG | tid)
         try:
-            await self.transport.send(frame)
-            await asyncio.wait_for(future, timeout)
+            async with asyncio.timeout(timeout):
+                await self.transport.send(reset)
+                await self.transport.send(noop)
+                await fence
         except TimeoutError:
+            self._quarantine[tid] = loop.time() + timeout
             raise SpinelTimeout("no reset notification") from None
         finally:
-            self._reset_waiter = None
+            self._reset_fence = None
+            await self._release_tid(tid)
+        if not self._reset_seen:
+            raise SpinelTimeout("no reset notification")
 
     def subscribe(self) -> asyncio.Queue[SpinelFrame]:
         """Return a queue receiving every unsolicited (TID 0) frame."""
@@ -276,6 +293,11 @@ class SpinelClient:
                 tid = self._free_tid()
             return tid
 
+    async def _release_tid(self, tid: int) -> None:
+        del self._pending[tid]
+        async with self._tid_released:
+            self._tid_released.notify()
+
     async def _read_loop(self) -> None:
         try:
             while True:
@@ -311,18 +333,22 @@ class SpinelClient:
             queue.put_nowait(frame)
 
     def _on_device_reset(self, status: int) -> None:
-        self._fail_pending(DeviceReset(status))
-        waiter = self._reset_waiter
-        if waiter is not None and not waiter.done():
-            waiter.set_result(status)
+        fence = self._reset_fence
+        if fence is not None:
+            # Part of reset(): fail the other requests, not its NOOP.
+            self._reset_seen = True
+            self._fail_pending(DeviceReset(status), keep=fence)
             return
+        self._fail_pending(DeviceReset(status))
         for callback in self.on_reset:
             try:
                 callback(status)
             except Exception:
                 log.exception("on_reset callback failed")
 
-    def _fail_pending(self, exc: Exception) -> None:
-        for future in self._pending.values():
+    def _fail_pending(self, exc: Exception, keep: int | None = None) -> None:
+        for tid, future in self._pending.items():
+            if tid == keep:
+                continue
             if not future.done():
                 future.set_exception(exc)

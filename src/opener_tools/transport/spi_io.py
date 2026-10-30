@@ -9,6 +9,7 @@ import re
 from typing import Protocol
 
 MISSING_EXTRA = "the SPI transport needs the spi extra: pip install 'opener-tools[spi]'"
+SETUP_HINT = "on the NR+Gate, see scripts/nrp-gate/install.sh"
 
 CONSUMER = "nrp-spi"
 
@@ -59,7 +60,10 @@ class LinuxSpiIo(SpiIo):
             raise RuntimeError(MISSING_EXTRA) from None
         self._active = Value.ACTIVE
         spi = spidev.SpiDev()
-        spi.open(self._bus, self._device)
+        try:
+            spi.open(self._bus, self._device)
+        except OSError as exc:
+            raise _named(exc, self.path) from exc
         self._spi = spi
         try:
             spi.mode = 0
@@ -108,4 +112,13 @@ class LinuxSpiIo(SpiIo):
     @staticmethod
     def _request(gpiod, chip_line: tuple[str, int], settings):
         chip, line = chip_line
-        return gpiod.request_lines(f"/dev/{chip}", consumer=CONSUMER, config={line: settings})
+        path = f"/dev/{chip}"
+        try:
+            return gpiod.request_lines(path, consumer=CONSUMER, config={line: settings})
+        except OSError as exc:
+            raise _named(exc, f"{path} line {line}") from exc
+
+
+def _named(exc: OSError, what: str) -> OSError:
+    """exc with what it failed on: spidev and gpiod leave the path out."""
+    return OSError(exc.errno, f"{what}: {exc.strerror} ({SETUP_HINT})")

@@ -23,6 +23,9 @@ DEFAULT_SPEED = 8_000_000
 # in one transaction.
 DEFAULT_CLOCK = 128
 BUSY_POLL_S = 0.0002
+# Pause before retrying after an invalid header or a refused frame: a device
+# without Spinel, or out of receive buffers, is not polled flat out.
+RETRY_DELAY_S = 0.001
 
 
 class SpiTransport(Transport):
@@ -75,9 +78,16 @@ class SpiTransport(Transport):
             raise TransportClosed(self.path)
         loop = asyncio.get_running_loop()
         accepted = loop.create_future()
-        self._pending.append((frame, accepted))
+        entry = (frame, accepted)
+        self._pending.append(entry)
         self._wake.set()
-        await accepted
+        try:
+            await accepted
+        except asyncio.CancelledError:
+            # Transactions run inline, so the frame is not half sent.
+            if entry in self._pending:
+                self._pending.remove(entry)
+            raise
 
     async def recv(self) -> bytes:
         if self._closed and self._frames.empty():
@@ -105,10 +115,13 @@ class SpiTransport(Transport):
                 await self._wait_not_busy()
                 await self._wait_work()
                 await self._wait_not_busy()
-                await self._exchange()
+                failed = await self._exchange()
                 # Let the other tasks run between transactions, also when
                 # the device keeps refusing a frame.
-                await asyncio.sleep(0)
+                delay = 0
+                if failed:
+                    delay = RETRY_DELAY_S
+                await asyncio.sleep(delay)
         except OSError:
             self._shut_down()
 
@@ -130,9 +143,10 @@ class SpiTransport(Transport):
                 return
             await self._wake.wait()
 
-    async def _exchange(self) -> None:
+    async def _exchange(self) -> bool:
         """Send the first pending frame and receive the device's, with a
-        second transaction if the device frame was longer than clocked."""
+        second transaction if the device frame was longer than clocked.
+        Return True if the header was invalid or the frame refused."""
         frame = b""
         if self._pending:
             frame, _ = self._pending[0]
@@ -140,15 +154,17 @@ class SpiTransport(Transport):
         header = parse_header(rx)
         if header is None:
             self.errors += 1
-            return
+            return True
+        refused = False
         if frame:
-            self._sent(header.recv_len)
+            accepted = self._sent(header.recv_len)
+            refused = not accepted
         data_len = header.data_len
         if data_len == 0:
-            return
+            return refused
         if data_len > self.max_frame:
             self.errors += 1
-            return
+            return refused
         end = HEADER_LEN + data_len
         if end > len(rx):
             await self._wait_not_busy()
@@ -156,13 +172,14 @@ class SpiTransport(Transport):
             header = parse_header(rx)
             if header is None:
                 self.errors += 1
-                return
+                return refused
             data_len = header.data_len
             end = HEADER_LEN + data_len
             if data_len == 0 or end > len(rx):
                 # Another frame than announced: the next IRQ brings it.
-                return
+                return refused
         self._frames.put_nowait(rx[HEADER_LEN:end])
+        return refused
 
     def _transfer(self, frame: bytes, clock: int) -> bytes:
         """Clock a header, frame and padding up to clock payload bytes."""
@@ -171,15 +188,17 @@ class SpiTransport(Transport):
         padding = bytes(payload - len(frame))
         return self._io.transfer(header + frame + padding)
 
-    def _sent(self, device_recv_len: int) -> None:
+    def _sent(self, device_recv_len: int) -> bool:
+        """Return False if the device had no room for the first pending frame."""
         frame, accepted = self._pending[0]
         if device_recv_len < len(frame):
             # No room on the device: sent again in a later transaction.
             self.errors += 1
-            return
+            return False
         self._pending.popleft()
         if not accepted.done():
             accepted.set_result(None)
+        return True
 
     def _shut_down(self) -> None:
         if self._closed:

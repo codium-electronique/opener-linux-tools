@@ -43,6 +43,17 @@ pub fn parse_header(data: &[u8]) -> Option<SpiHeader> {
     Some(SpiHeader { recv_len, data_len })
 }
 
+/// Device frame of a transaction, if its header is valid and the transaction
+/// clocked the whole frame: the device then counts it as sent.
+pub fn clocked_frame(rx: &[u8]) -> Option<&[u8]> {
+    let header = parse_header(rx)?;
+    let end = HEADER_LEN + usize::from(header.data_len);
+    if header.data_len == 0 || end > rx.len() {
+        return None;
+    }
+    Some(&rx[HEADER_LEN..end])
+}
+
 /// Spinel header byte: flag, IID 0 and the transaction id (1..=15).
 pub fn spinel_header(tid: u8) -> u8 {
     0x80 | (tid & 0x0f)
@@ -134,6 +145,19 @@ mod tests {
         assert_eq!(out, [0x80, 0x78]);
         assert_eq!(decode_packed(&out), Some((0x3c00, 2)));
         assert_eq!(decode_packed(&[0x80]), None);
+    }
+
+    #[test]
+    fn clocked_frame_whole_only() {
+        let mut rx = build_header(1300, 3).to_vec();
+        rx.extend_from_slice(&[0x80, 0x06, 0x00, 0xff, 0xff]);
+        assert_eq!(clocked_frame(&rx), Some(&[0x80, 0x06, 0x00][..]));
+        // Announced longer than clocked: not sent by the device.
+        let mut long = build_header(1300, 600).to_vec();
+        long.extend_from_slice(&[0; 128]);
+        assert_eq!(clocked_frame(&long), None);
+        assert_eq!(clocked_frame(&build_header(1300, 0)), None);
+        assert_eq!(clocked_frame(&[0xff; 133]), None);
     }
 
     #[test]

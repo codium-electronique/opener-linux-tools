@@ -135,3 +135,82 @@ def test_missing_extra(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"pip install 'opener-tools\[spi\]'"):
         io.open()
+
+
+async def test_cancelled_send_not_sent(link):
+    transport, device = link
+    device.recv_len = 0
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(transport.send(b"\x81\x02\x03"), 0.05)
+
+    device.recv_len = 1300
+    await send(transport, b"\x82\x02\x03")
+
+    assert device.received == [b"\x82\x02\x03"]
+
+
+@pytest.mark.parametrize("refuse", ["no_room", "invalid_header"])
+async def test_retries_back_off(link, refuse):
+    transport, device = link
+    if refuse == "no_room":
+        device.recv_len = 0
+    else:
+        device.garbage_always()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(transport.send(b"\x81\x02\x03"), 0.1)
+
+    # Without a pause between retries, thousands of transactions.
+    assert len(device.transfers) <= 100
+
+
+class FailingOpen:
+    """Stand-in for spidev and gpiod whose opens fail with error."""
+
+    def __init__(self, error):
+        self.error = error
+
+    def SpiDev(self):
+        return self
+
+    def open(self, bus, device):
+        raise self.error
+
+    def request_lines(self, path, consumer, config):
+        raise self.error
+
+    def LineSettings(self, **settings):
+        return settings
+
+    def close(self):
+        pass
+
+
+class FakeLine:
+    Direction = Edge = Value = type("Enum", (), {"INPUT": 0, "RISING": 1, "ACTIVE": 1})
+
+
+def fake_modules(monkeypatch, spidev, gpiod):
+    monkeypatch.setitem(sys.modules, "spidev", spidev)
+    monkeypatch.setitem(sys.modules, "gpiod", gpiod)
+    monkeypatch.setitem(sys.modules, "gpiod.line", FakeLine)
+
+
+def test_open_error_names_spidev(monkeypatch):
+    failing = FailingOpen(FileNotFoundError(2, "No such file or directory"))
+    fake_modules(monkeypatch, failing, failing)
+    io = LinuxSpiIo("/dev/spidev3.0", ("gpiochip4", 0), ("gpiochip1", 1), 8_000_000)
+
+    with pytest.raises(OSError, match=r"/dev/spidev3\.0.*No such file.*install\.sh"):
+        io.open()
+
+
+def test_open_error_names_gpio_line(monkeypatch):
+    spi = FailingOpen(None)
+    spi.open = lambda bus, device: None
+    gpio = FailingOpen(PermissionError(13, "Permission denied"))
+    fake_modules(monkeypatch, spi, gpio)
+    io = LinuxSpiIo("/dev/spidev3.0", ("gpiochip4", 0), ("gpiochip1", 1), 8_000_000)
+
+    with pytest.raises(OSError, match=r"/dev/gpiochip4 line 0.*Permission denied"):
+        io.open()

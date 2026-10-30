@@ -114,6 +114,9 @@ class ScriptedDevice:
         if cmd == SPINEL.CMD_RESET:
             self.transport.inject(status_frame(0, SPINEL.STATUS_RESET_SOFTWARE))
             return
+        if cmd == SPINEL.CMD_NOOP:
+            self.transport.inject(status_frame(tid, SPINEL.STATUS_OK))
+            return
         prop, prop_len = SpinelCodec.parse_i(frame[1 + cmd_len :])
         value = frame[1 + cmd_len + prop_len :]
 
@@ -291,7 +294,7 @@ class SniffDevice(ScriptedDevice):
         cmd, cmd_len = SpinelCodec.parse_i(frame[1:])
         prop = None
         value = b""
-        if cmd != SPINEL.CMD_RESET:
+        if cmd not in (SPINEL.CMD_RESET, SPINEL.CMD_NOOP):
             prop, prop_len = SpinelCodec.parse_i(frame[1 + cmd_len :])
             value = frame[1 + cmd_len + prop_len :]
         self.requests.append((cmd, prop, value))
@@ -392,6 +395,7 @@ class FakeSpiDevice:
         self._reset = True
         self._busy_polls = 0
         self._garbage = False
+        self._garbage_always = False
         self._fail = False
         self._irq_read = -1
         self._irq_write = -1
@@ -411,6 +415,10 @@ class FakeSpiDevice:
     def garbage_next(self) -> None:
         """Answer the next transaction as an unarmed SPIS: all 0xff."""
         self._garbage = True
+
+    def garbage_always(self) -> None:
+        """Answer every transaction with 0xff, as a device without Spinel."""
+        self._garbage_always = True
 
     def fail_next(self) -> None:
         """Make the next transfer raise OSError, as when the device is gone."""
@@ -432,7 +440,7 @@ class FakeSpiDevice:
         assert self._busy_polls == 0, "transfer while BUSY is active"
         clocked = len(data)
         self.transfers.append(clocked)
-        if self._garbage:
+        if self._garbage or self._garbage_always:
             self._garbage = False
             return b"\xff" * clocked
 

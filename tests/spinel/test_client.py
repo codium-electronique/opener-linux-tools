@@ -210,11 +210,86 @@ async def test_reset_ok(client, fake):
     reset = asyncio.create_task(client.reset())
     frame = await fake.sent.get()
     assert frame == bytes([0x80, SPINEL.CMD_RESET])
+    tid = await next_noop(fake)
 
     fake.inject(status_frame(0, SPINEL.STATUS_RESET_SOFTWARE))
+    fake.inject(status_frame(tid, SPINEL.STATUS_OK))
 
     await asyncio.wait_for(reset, TIMEOUT)
     assert resets == []
+
+
+async def next_noop(fake):
+    """Wait for the NOOP that reset() sends after CMD_RESET; return its TID."""
+    frame = await asyncio.wait_for(fake.sent.get(), TIMEOUT)
+    tid = frame[0] & 0x0F
+    assert frame == bytes([0x80 | tid, SPINEL.CMD_NOOP])
+    assert tid != 0
+    return tid
+
+
+async def test_reset_ignores_stale_reset_status(client, fake):
+    # Over SPI, a notification the device could not send stays armed and
+    # comes out with CMD_RESET: here the boot notification.
+    resets = []
+    client.on_reset.append(resets.append)
+    reset = asyncio.create_task(client.reset())
+    await fake.sent.get()
+    fake.inject(status_frame(0, SPINEL.STATUS_RESET_POWER_ON))
+    tid = await next_noop(fake)
+    await asyncio.sleep(0.01)
+    assert not reset.done()
+
+    fake.inject(status_frame(0, SPINEL.STATUS_RESET_SOFTWARE))
+    fake.inject(status_frame(tid, SPINEL.STATUS_OK))
+
+    await asyncio.wait_for(reset, TIMEOUT)
+    assert resets == []
+
+
+async def test_reset_without_notification_times_out(client, fake):
+    reset = asyncio.create_task(client.reset(timeout=TIMEOUT))
+    await fake.sent.get()
+    tid = await next_noop(fake)
+
+    fake.inject(status_frame(tid, SPINEL.STATUS_OK))
+
+    with pytest.raises(SpinelTimeout):
+        await asyncio.wait_for(reset, 2 * TIMEOUT)
+
+
+async def test_reset_fails_other_requests(client, fake):
+    get = asyncio.create_task(client.get(nrp.PROP_DRV_TIME))
+    await fake.sent.get()
+    reset = asyncio.create_task(client.reset())
+    await fake.sent.get()
+    tid = await next_noop(fake)
+
+    fake.inject(status_frame(0, SPINEL.STATUS_RESET_SOFTWARE))
+    fake.inject(status_frame(tid, SPINEL.STATUS_OK))
+
+    await asyncio.wait_for(reset, TIMEOUT)
+    with pytest.raises(DeviceReset):
+        await get
+
+
+async def never_sent(frame):
+    await asyncio.Future()
+
+
+async def test_request_times_out_when_send_blocks(client, fake):
+    # A device that never accepts the frame (BUSY stuck, no firmware).
+    fake.send = never_sent
+
+    with pytest.raises(SpinelTimeout):
+        await asyncio.wait_for(client.get(nrp.PROP_DRV_TIME), 2 * TIMEOUT)
+
+
+async def test_reset_times_out_when_send_blocks(client, fake):
+    fake.send = never_sent
+
+    with pytest.raises(SpinelTimeout):
+        await asyncio.wait_for(client.reset(timeout=TIMEOUT), 2 * TIMEOUT)
 
 
 async def test_unsolicited_reset_callback(client, fake):

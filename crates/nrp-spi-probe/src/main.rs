@@ -118,6 +118,7 @@ fn bench(
 ) -> Result<Vec<Sample>> {
     let epoch = Instant::now();
     let first = link.transactions;
+    let first_invalid = link.invalid_headers;
     let mut samples = Vec::with_capacity(args.count);
     for _ in 0..args.count {
         let start = Instant::now();
@@ -136,12 +137,13 @@ fn bench(
 
     let n = samples.len();
     let transactions = (link.transactions - first) as f64 / n as f64;
+    let invalid = link.invalid_headers - first_invalid;
     let mut times: Vec<Duration> = samples.iter().map(|s| s.round_trip).collect();
     let total: Duration = times.iter().sum();
     times.sort();
     println!(
         "{name}: {n} round trips at {} Hz, {} B clocked: mean {:.0} us, min {:.0}, median {:.0}, \
-         p99 {:.0}, max {:.0}, {:.2} transactions each",
+         p99 {:.0}, max {:.0}, {:.2} transactions each, {invalid} invalid headers",
         args.speed,
         args.clock,
         micros(total) / n as f64,
