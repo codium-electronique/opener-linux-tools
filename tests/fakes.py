@@ -213,3 +213,154 @@ class FakeRadio:
                 yield event
         finally:
             self._streams.remove(queue)
+
+
+class SniffDevice(ScriptedDevice):
+    """ScriptedDevice whose RX operations run on a modem clock that follows
+    the host clock.
+
+    The device answers INTERFACE_TYPE, CAPS and DRV_CAPS (caps), and DRV_TIME
+    from its clock. An inserted operation starts at its start time (now if
+    unscheduled) and emits there the next frame of script, if any: script
+    holds functions returning a frame for a token. It sends OP_FINISHED at its
+    end. requests logs every request as (cmd, prop, value), prop None for
+    RESET. after_insert(count), if set, is called with the number of inserts
+    so far before each INSERTED reply.
+    """
+
+    def __init__(self, transport: FakeTransport, caps: DrvCaps):
+        super().__init__(transport)
+        self.caps = caps
+        self.requests: list[tuple[int, int | None, bytes]] = []
+        self.ops: list[tuple[int, int, int, int]] = []
+        self.script: list[Callable[[int], bytes]] = []
+        self.emitted = 0
+        self.after_insert: Callable[[int], None] | None = None
+        self.running_at_disable: int | None = None
+        self._watches: list[list] = []
+        self._timers: dict[int, list[asyncio.TimerHandle]] = {}
+        self._origin = 0.0
+        self._set_defaults()
+
+    def start(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._origin = loop.time()
+        super().start()
+
+    async def stop(self) -> None:
+        self._abort_ops()
+        await super().stop()
+
+    def clock(self) -> int:
+        loop = asyncio.get_running_loop()
+        elapsed = loop.time() - self._origin
+        ticks_per_s = self.caps.timing.ticks_per_ms * 1000
+        return round(elapsed * ticks_per_s)
+
+    def when_written(self, n: int, after: int, callback: Callable[[], None]) -> None:
+        """Call callback once the host has handled the n-th emitted frame: at
+        the after-th insert following its emission. With after set to the
+        pipeline depth, the windows queued before it have all been replaced."""
+        self._watches.append([n, after, callback, 0])
+
+    def power_on_reset(self) -> None:
+        """Reboot: abort the operations, forget the settings, notify."""
+        self._abort_ops()
+        self._set_defaults()
+        self.transport.inject(status_frame(0, SPINEL.STATUS_RESET_POWER_ON))
+
+    def _set_defaults(self) -> None:
+        caps_fields = dataclasses.astuple(self.caps)
+        self.props = {
+            SPINEL.PROP_INTERFACE_TYPE: SpinelCodec.encode_i(nrp.INTERFACE_TYPE),
+            SPINEL.PROP_CAPS: SpinelCodec.encode_i(nrp.CAP_DRV),
+            nrp.PROP_DRV_CAPS: SpinelCodec.encode_fields(nrp.FMT_DRV_CAPS, *caps_fields),
+        }
+
+    def _answer(self, frame: bytes) -> None:
+        cmd, cmd_len = SpinelCodec.parse_i(frame[1:])
+        prop = None
+        value = b""
+        if cmd != SPINEL.CMD_RESET:
+            prop, prop_len = SpinelCodec.parse_i(frame[1 + cmd_len :])
+            value = frame[1 + cmd_len + prop_len :]
+        self.requests.append((cmd, prop, value))
+
+        if cmd == SPINEL.CMD_RESET:
+            self._abort_ops()
+        if cmd == SPINEL.CMD_PROP_VALUE_GET and prop == nrp.PROP_DRV_TIME:
+            now = self.clock()
+            self.props[nrp.PROP_DRV_TIME] = SpinelCodec.encode_fields("X", now)
+        if cmd == SPINEL.CMD_PROP_VALUE_SET and prop == nrp.PROP_DRV_ENABLED:
+            if value == b"\x00":
+                self.running_at_disable = len(self._timers)
+        super()._answer(frame)
+
+    def _answer_insert(self, tid: int, prop: int, value: bytes) -> None:
+        self.inserts.append(value)
+        fields = SpinelCodec.parse_fields(value, nrp.FMT_OP_PREFIX + nrp.FMT_OP_RX)
+        token, _, _, flags, start, duration, _ = fields
+        self.ops.append((token, flags, start, duration))
+        self._check_watches()
+        if self.after_insert is not None:
+            self.after_insert(len(self.inserts))
+
+        reply = SpinelCodec.encode_fields("S", token)
+        self.transport.inject(make_frame(tid, SPINEL.RSP_PROP_VALUE_INSERTED, prop, reply))
+        self._run_op(token, start, duration)
+
+    def _check_watches(self) -> None:
+        for watch in list(self._watches):
+            n, after, callback, seen = watch
+            if self.emitted < n:
+                continue
+            watch[3] = seen + 1
+            if watch[3] == after:
+                self._watches.remove(watch)
+                callback()
+
+    def _run_op(self, token: int, start: int, duration: int) -> None:
+        loop = asyncio.get_running_loop()
+        now = self.clock()
+        ticks_per_s = self.caps.timing.ticks_per_ms * 1000
+        start_delay = max(start - now, 0) / ticks_per_s
+        end_delay = max(start + duration - now, 0) / ticks_per_s
+        emit = loop.call_later(start_delay, self._emit, token)
+        finish = loop.call_later(end_delay, self._finish, token)
+        self._timers[token] = [emit, finish]
+
+    def _emit(self, token: int) -> None:
+        if not self.script:
+            return
+        make_event = self.script.pop(0)
+        frame = make_event(token)
+        self.transport.inject(frame)
+        self.emitted += 1
+
+    def _finish(self, token: int) -> None:
+        del self._timers[token]
+        frame = event_frame(token, nrp.EVENT_OP_FINISHED)
+        self.transport.inject(frame)
+
+    def _abort_ops(self) -> None:
+        for handles in self._timers.values():
+            for handle in handles:
+                handle.cancel()
+        self._timers.clear()
+
+
+class DeviceTransport(FakeTransport):
+    """FakeTransport that starts its device when opened and stops it when
+    closed, for code that opens the transport itself."""
+
+    def __init__(self):
+        super().__init__()
+        self.device: ScriptedDevice | None = None
+
+    async def open(self) -> None:
+        await super().open()
+        self.device.start()
+
+    async def close(self) -> None:
+        await super().close()
+        await self.device.stop()

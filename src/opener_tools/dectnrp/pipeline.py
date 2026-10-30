@@ -30,6 +30,7 @@ class PipelineStats:
     early_finishes: int = 0
     gaps: int = 0
     gap_ticks: int = 0
+    dropped_events: int = 0
 
 
 def _retrieve_exception(task: asyncio.Future) -> None:
@@ -121,6 +122,8 @@ class RxPipeline:
             while self._windows:
                 event = await self._wait_event(next_event)
                 next_event = asyncio.ensure_future(anext(stream))
+                # Drops are reported on the next event sent, whatever its op.
+                self.stats.dropped_events += event.dropped
                 window = self._windows.get(event.token)
                 if window is None:
                     continue

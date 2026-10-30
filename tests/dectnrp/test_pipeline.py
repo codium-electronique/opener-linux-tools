@@ -6,7 +6,7 @@ import asyncio
 import pytest
 from fakes import FakeRadio, make_caps
 
-from opener_tools.dectnrp import MsgError, MsgReceived, pipeline
+from opener_tools.dectnrp import MsgError, MsgReceived, OpFinished, pipeline
 from opener_tools.dectnrp.pipeline import Gap, RxPipeline
 from opener_tools.spinel.client import DeviceReset, SpinelError
 from opener_tools.spinel.dectnrp_constants import Reception
@@ -191,6 +191,22 @@ async def test_early_finish_counted(radio):
 
     assert rx.stats.early_finishes == 1
     assert not any(isinstance(item, Gap) for item in consumer.items)
+    consumer.task.cancel()
+
+
+async def test_dropped_counted(radio):
+    rx = RxPipeline(radio, CHANNEL, 20, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+    op = radio.scheduled[0][0]
+
+    # The device reports its drops on the next event sent, whatever its token.
+    radio.emit(MsgReceived(op.token, 0, 2, 1, T0, 0x50, 20, CHANNEL, bytes(10), b"hi"))
+    radio.emit(OpFinished(op.token, 0, 3))
+    radio.emit(OpFinished(999, 0, 1))
+    await settle()
+
+    assert rx.stats.dropped_events == 6
     consumer.task.cancel()
 
 

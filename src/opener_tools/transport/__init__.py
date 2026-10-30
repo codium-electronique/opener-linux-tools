@@ -3,13 +3,29 @@
 
 """Device transports, selected by URL."""
 
-from urllib.parse import parse_qs, urlsplit
+from collections.abc import Callable
+from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from .base import Transport, TransportClosed
 from .tcp import TcpTransport
 from .uart import DEFAULT_BAUD, UartTransport
 
-__all__ = ["TcpTransport", "Transport", "TransportClosed", "UartTransport", "open_transport"]
+__all__ = [
+    "TcpTransport",
+    "Transport",
+    "TransportClosed",
+    "UartTransport",
+    "open_transport",
+    "register_scheme",
+]
+
+_schemes: dict[str, Callable[[SplitResult], Transport]] = {}
+
+
+def register_scheme(scheme: str, factory: Callable[[SplitResult], Transport]) -> None:
+    """Make open_transport create the transport of scheme URLs with factory,
+    which gets the split URL; it takes precedence over the built-in schemes."""
+    _schemes[scheme] = factory
 
 
 def _open_uart(path: str, query: str) -> UartTransport:
@@ -39,6 +55,9 @@ def open_transport(url: str) -> Transport:
     if url.startswith("/dev/"):
         return UartTransport(url)
     parts = urlsplit(url)
+    factory = _schemes.get(parts.scheme)
+    if factory is not None:
+        return factory(parts)
     if parts.scheme == "uart":
         return _open_uart(parts.path, parts.query)
     if parts.scheme == "tcp":

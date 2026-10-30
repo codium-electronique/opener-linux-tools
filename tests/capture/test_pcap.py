@@ -6,26 +6,12 @@ import struct
 import subprocess
 
 import pytest
+from pcapfile import read_pcap
 
 from opener_tools.capture.pcap import PcapWriter
 
 GLOBAL_HEADER = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 304)
 RECORDS = [bytes(72), bytes(range(89)), bytes(200)]
-
-
-def read_pcap(data):
-    """Return the global header fields and the (sec, usec, record) list."""
-    header = struct.unpack_from("<IHHiIII", data)
-    offset = 24
-    records = []
-    while offset < len(data):
-        sec, usec, incl, orig = struct.unpack_from("<IIII", data, offset)
-        assert incl == orig
-        offset += 16
-        records.append((sec, usec, data[offset : offset + incl]))
-        offset += incl
-    assert offset == len(data)
-    return header, records
 
 
 def write_records(path):

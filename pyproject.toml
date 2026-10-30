@@ -12,6 +12,9 @@ license-files = ["LICENSE", "src/opener_tools/spinel/NOTICE"]
 requires-python = ">=3.11"
 dependencies = ["pyserial>=3.5"]
 
+[project.scripts]
+nrp-sniffer = "opener_tools.cli.sniffer:main"
+
 [project.optional-dependencies]
 spi = ["spidev", "gpiod>=2"]
 hub = ["aiohttp>=3.9"]

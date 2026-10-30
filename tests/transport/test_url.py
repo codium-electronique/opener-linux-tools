@@ -3,7 +3,13 @@
 
 import pytest
 
-from opener_tools.transport import TcpTransport, UartTransport, open_transport
+from opener_tools import transport
+from opener_tools.transport import (
+    TcpTransport,
+    UartTransport,
+    open_transport,
+    register_scheme,
+)
 
 
 def test_uart_url_default_baud():
@@ -54,3 +60,18 @@ def test_spi_url_not_implemented():
 def test_bad_urls(url):
     with pytest.raises(ValueError):
         open_transport(url)
+
+
+def test_registered_scheme(monkeypatch):
+    monkeypatch.setattr(transport, "_schemes", {})
+    opened = []
+    tcp = TcpTransport("localhost", 1)
+
+    def factory(parts):
+        opened.append(parts)
+        return tcp
+
+    register_scheme("tcp", factory)
+
+    assert open_transport("tcp://example:7") is tcp
+    assert opened[0].hostname == "example"
