@@ -245,3 +245,163 @@ async def test_stop_drains(radio):
 async def test_depth_exceeds_slots(radio):
     with pytest.raises(ValueError):
         RxPipeline(radio, CHANNEL, 20, depth=9)
+
+
+LONG = 200 * TICKS_PER_MS
+
+
+async def frame_ends(radio, op, offset_ms, event=received):
+    """A frame offset_ms into the window of op ends it (single-shot)."""
+    _, start, _, _ = next(entry for entry in radio.scheduled if entry[0] is op)
+    radio.clock = start + offset_ms * TICKS_PER_MS
+    radio.emit(event(op))
+    radio.finish(op)
+    await settle()
+
+
+async def test_fill_after_early_finish(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=3)
+    consumer = Consumer(rx)
+    await settle()
+    spacing = LONG + TRANSITION
+    first = radio.scheduled[0][0]
+
+    await frame_ends(radio, first, 20)
+
+    # The fill covers the rest of the window, up to the next queued one.
+    fill_start = radio.clock + LEAD
+    next_start = T0 + LEAD + spacing
+    _, start, duration, _ = radio.scheduled[3]
+    assert (start, duration) == (fill_start, next_start - TRANSITION - fill_start)
+    # The grid goes on.
+    assert starts(radio)[4] == T0 + LEAD + 3 * spacing
+    assert len(radio.scheduled) == 5
+    assert rx.stats.fills == 1
+    consumer.task.cancel()
+
+
+async def test_fill_after_crc_error(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+
+    await frame_ends(radio, radio.scheduled[0][0], 20, error)
+
+    assert rx.stats.fills == 1
+    consumer.task.cancel()
+
+
+async def test_no_fill_at_window_end(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+
+    radio.finish(radio.scheduled[0][0])
+    await settle()
+
+    assert len(radio.scheduled) == 3
+    assert rx.stats.fills == 0
+    consumer.task.cancel()
+
+
+async def test_no_fill_too_short(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+
+    # With the lead, less than 1 ms is left before the next window.
+    await frame_ends(radio, radio.scheduled[0][0], 179.5)
+
+    assert len(radio.scheduled) == 3
+    assert rx.stats.fills == 0
+    consumer.task.cancel()
+
+
+async def test_fill_of_a_fill(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+    await frame_ends(radio, radio.scheduled[0][0], 20)
+    fill = radio.scheduled[2][0]
+
+    await frame_ends(radio, fill, 30)
+
+    # Up to the same next window; a fill does not extend the grid.
+    fill_start = radio.clock + LEAD
+    next_start = T0 + LEAD + LONG + TRANSITION
+    _, start, duration, _ = radio.scheduled[4]
+    assert (start, duration) == (fill_start, next_start - TRANSITION - fill_start)
+    assert len(radio.scheduled) == 5
+    assert rx.stats.fills == 2
+    consumer.task.cancel()
+
+
+async def test_fill_end_schedules_nothing(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+    await frame_ends(radio, radio.scheduled[0][0], 20)
+    fill = radio.scheduled[2][0]
+
+    radio.finish(fill)
+    await settle()
+
+    assert len(radio.scheduled) == 4
+    consumer.task.cancel()
+
+
+async def test_fill_rejected(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+
+    radio.reject = 1
+    await frame_ends(radio, radio.scheduled[0][0], 20)
+
+    # The rest of the window stays uncovered, as without fills: no resync.
+    assert rx.stats.fill_rejects == 1
+    assert rx.stats.gaps == 0
+    assert starts(radio)[2] == T0 + LEAD + 2 * (LONG + TRANSITION)
+    consumer.task.cancel()
+
+
+async def test_no_fill_when_not_single_shot(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2, reception=Reception.SEMICONTINUOUS)
+    consumer = Consumer(rx)
+    await settle()
+
+    await frame_ends(radio, radio.scheduled[0][0], 20)
+
+    assert rx.stats.fills == 0
+    consumer.task.cancel()
+
+
+async def test_fill_while_stopping(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+    first, second = [op for op, _, _, _ in radio.scheduled]
+
+    stopping = asyncio.create_task(rx.stop())
+    await settle()
+    await frame_ends(radio, first, 20)
+
+    # Up to the queued window: the fill does not make the drain longer.
+    fill_start = radio.clock + LEAD
+    next_start = T0 + LEAD + LONG + TRANSITION
+    _, start, duration, _ = radio.scheduled[2]
+    assert (start, duration) == (fill_start, next_start - TRANSITION - fill_start)
+    assert len(radio.scheduled) == 3
+
+    # Nothing is queued after the last window: no fill.
+    await frame_ends(radio, second, 20)
+    radio.finish(radio.scheduled[2][0])
+    await asyncio.wait_for(stopping, TIMEOUT)
+    assert len(radio.scheduled) == 3
+    consumer.task.cancel()
+
+
+async def test_slot_kept_for_fills(radio):
+    # make_caps has 8 operation slots.
+    with pytest.raises(ValueError):
+        RxPipeline(radio, CHANNEL, 20, depth=8)

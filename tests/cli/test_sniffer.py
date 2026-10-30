@@ -204,7 +204,9 @@ def test_cli_args(device, tmp_path):
     device.after_insert = interrupt_at(1)
     path = tmp_path / "out.pcap"
 
-    code = main(["--transport", "fake://", "-w", str(path), "--network-id", "0x1234"])
+    code = main(
+        ["--transport", "fake://", "-w", str(path), "--window", "20", "--network-id", "0x1234"]
+    )
 
     assert code == 0
     network_id = SpinelCodec.encode_fields("L", 0x1234)
@@ -215,7 +217,7 @@ def test_cli_args(device, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "args, window_ms", [(["--window", "5"], 5), (["--window", "0.5"], 0.5), ([], 20)]
+    "args, window_ms", [(["--window", "5"], 5), (["--window", "0.5"], 0.5), ([], 200)]
 )
 def test_window_option(device, tmp_path, args, window_ms):
     device.after_insert = interrupt_at(1)
@@ -242,7 +244,7 @@ def test_rx_mode_option(device, tmp_path):
     device.after_insert = interrupt_at(1)
     path = tmp_path / "out.pcap"
 
-    main(["--transport", "fake://", "-w", str(path), "--rx-mode", "continuous"])
+    main(["--transport", "fake://", "-w", str(path), "--window", "20", "--rx-mode", "continuous"])
 
     _, flags, _, _ = device.ops[0]
     reception = (flags & nrp.OP_FLAG_RX_RECEPTION_MASK) >> nrp.OP_FLAG_RX_RECEPTION_SHIFT
@@ -255,7 +257,8 @@ def test_modem_time_option(device, tmp_path, args, expected):
     device.when_written(1, DEPTH, lambda: os.kill(os.getpid(), signal.SIGINT))
     path = tmp_path / "out.pcap"
 
-    main(["--transport", "fake://", "-w", str(path), *args])
+    # Short windows: the fake device runs them in real time.
+    main(["--transport", "fake://", "-w", str(path), "--window", "20", *args])
 
     data = path.read_bytes()
     _, records = read_pcap(data)

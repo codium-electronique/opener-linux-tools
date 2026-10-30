@@ -97,7 +97,7 @@ def test_config_lists_args(capsys):
     assert "{default=0x32545279}" in args[2]
     assert "{type=selector}" in args[3]
     assert "{type=double}" in args[4]
-    assert "{default=20}" in args[4]
+    assert "{default=200}" in args[4]
     assert "{type=unsigned}" in args[5]
     assert "{default=4}" in args[5]
     assert "{type=boolflag}" in args[6]

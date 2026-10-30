@@ -23,10 +23,10 @@ from opener_tools.spinel.dectnrp_constants import Reception
 from opener_tools.transport import open_transport
 
 # Single-shot is the only mode in which the nRF91 receives every frame
-# format; a received frame ends the window, short windows bound the time
-# left uncovered.
+# format. A received frame ends the window, and the pipeline fills the rest
+# of it; long windows keep few window boundaries, where frames are missed.
 DEFAULT_RX_MODE = Reception.SINGLE_SHOT
-DEFAULT_WINDOW_MS = 20.0
+DEFAULT_WINDOW_MS = 200.0
 # The dectnrp-driver sample values.
 DEFAULT_CHANNEL = 1677
 DEFAULT_NETWORK_ID = 0x32545279

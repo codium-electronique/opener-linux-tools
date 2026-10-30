@@ -14,6 +14,9 @@ from opener_tools.spinel.dectnrp_constants import Reception
 from .events import Event, MsgError, MsgReceived, OpFinished
 from .radio import Op, Radio
 
+# Shorter fill windows are not worth an operation.
+FILL_MIN_MS = 1.0
+
 
 @dataclass(frozen=True)
 class Gap:
@@ -28,6 +31,8 @@ class Gap:
 class PipelineStats:
     windows: int = 0
     early_finishes: int = 0
+    fills: int = 0
+    fill_rejects: int = 0
     gaps: int = 0
     gap_ticks: int = 0
     dropped_events: int = 0
@@ -43,6 +48,9 @@ def _retrieve_exception(task: asyncio.Future) -> None:
 class _Window:
     op: Op
     task: asyncio.Future
+    start: int
+    fill: bool = field(default=False)
+    # A frame, received or failing its PDC CRC, ended the window.
     received: bool = field(default=False)
 
 
@@ -56,6 +64,12 @@ class RxPipeline:
 
     Consecutive windows are separated by the device's sched_op_transition,
     since the modem rejects exactly adjacent windows (1 ms if unknown).
+
+    In single-shot mode a frame ends its window early. The pipeline then
+    schedules a fill window over the rest of it: from lead after now up to
+    the next queued window, if that leaves FILL_MIN_MS at least. A fill
+    ended by a frame gets a fill in turn; fills do not extend the queue.
+    One operation slot is kept for them.
     """
 
     def __init__(
@@ -68,8 +82,10 @@ class RxPipeline:
         reception: Reception = Reception.SINGLE_SHOT,
     ):
         caps = radio.caps
-        if depth > caps.op_slots:
-            raise ValueError(f"depth {depth} exceeds the {caps.op_slots} operation slots")
+        if depth >= caps.op_slots:
+            raise ValueError(
+                f"depth {depth} leaves no fill slot in the {caps.op_slots} operation slots"
+            )
         timing = caps.timing
         self.radio = radio
         self.channel = channel
@@ -83,7 +99,9 @@ class RxPipeline:
         transition = caps.sched_op_transition
         if transition == 0:
             transition = timing.ms_to_ticks(1)
+        self._transition = transition
         self._spacing = self._window + transition
+        self._fill_min = timing.ms_to_ticks(FILL_MIN_MS)
         self._next_start = 0
         self._modem_anchor = 0
         self._host_anchor = 0.0
@@ -129,13 +147,17 @@ class RxPipeline:
                     continue
                 if isinstance(event, OpFinished):
                     del self._windows[event.token]
-                    if window.received and self.reception == Reception.SINGLE_SHOT:
+                    single_shot = self.reception == Reception.SINGLE_SHOT
+                    if window.received and single_shot:
                         self.stats.early_finishes += 1
+                        await self._schedule_fill()
+                    if window.fill:
+                        continue
                     gaps = await self._schedule_next()
                     for gap in gaps:
                         yield gap
                     continue
-                if isinstance(event, MsgReceived):
+                if isinstance(event, MsgReceived | MsgError):
                     window.received = True
                 if isinstance(event, MsgReceived | MsgError):
                     yield event
@@ -201,12 +223,44 @@ class RxPipeline:
                 gap = await self._resync("rejected", skipped)
                 gaps.append(gap)
                 op = await self._insert()
-            task = asyncio.ensure_future(op)
-            task.add_done_callback(_retrieve_exception)
-            self._windows[op.token] = _Window(op, task)
-            self.stats.windows += 1
+            self._add_window(op, self._next_start, fill=False)
             self._next_start += self._spacing
         return gaps
+
+    async def _schedule_fill(self) -> None:
+        """Schedule a window from lead after now up to the next queued one."""
+        async with self._schedule_lock:
+            start = self._now_estimate() + self._lead
+            # The next window is either queued or the next one to queue;
+            # when stopping, only a queued one, so the drain is no longer.
+            end = None
+            if not self._stopping:
+                end = self._next_start
+            for window in self._windows.values():
+                is_later = window.start >= start
+                if is_later and (end is None or window.start < end):
+                    end = window.start
+            if end is None:
+                return
+            duration = end - self._transition - start
+            if duration < self._fill_min:
+                return
+            try:
+                op = await self.radio.schedule_rx(
+                    self.channel, duration, start=start, reception=self.reception
+                )
+            except SpinelError:
+                # The rest of the window stays uncovered, as without fills.
+                self.stats.fill_rejects += 1
+                return
+            self._add_window(op, start, fill=True)
+            self.stats.fills += 1
+
+    def _add_window(self, op: Op, start: int, fill: bool) -> None:
+        task = asyncio.ensure_future(op)
+        task.add_done_callback(_retrieve_exception)
+        self._windows[op.token] = _Window(op, task, start, fill)
+        self.stats.windows += 1
 
     async def _insert(self) -> Op:
         return await self.radio.schedule_rx(

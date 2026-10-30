@@ -14,7 +14,15 @@ import subprocess
 import pytest
 from pcapfile import read_pcap
 
-from opener_tools.capture.tap import HDR_LEN, TLV_DATA_TYPE, TLV_LEN, TLV_PAD, parse_tap_record
+from opener_tools.capture.tap import (
+    HDR_LEN,
+    TLV_DATA_TYPE,
+    TLV_LEN,
+    TLV_MODEM_TIME_HI,
+    TLV_MODEM_TIME_LO,
+    TLV_PAD,
+    parse_tap_record,
+)
 from opener_tools.cli.sniffer import (
     DEFAULT_CHANNEL,
     DEFAULT_LEAD_MS,
@@ -28,6 +36,9 @@ pytestmark = pytest.mark.simdev
 
 CAPTURE_S = 3.0
 DEPTH = 4
+# The simdev's frame period (CONFIG_DECTNRP_DRIVER_MOCK_AUTO_EMIT_PERIOD_MS),
+# in its modem ticks.
+EMIT_PERIOD = 100 * 69120
 # The first Wireshark release with the DECT-NR-TAP dissector.
 TSHARK_MIN = (4, 7, 4)
 # Data type 5: no PCC, nothing for the DECT NR+ dissector.
@@ -60,6 +71,12 @@ async def capture(url, path, modem_time=False):
     return stats
 
 
+def modem_time(value):
+    high = value[TLV_MODEM_TIME_HI]
+    low = value[TLV_MODEM_TIME_LO]
+    return (high << 32) | low
+
+
 def pad_count(record):
     tlvs_len = struct.unpack_from("<H", record, 2)[0]
     offsets = range(HDR_LEN, HDR_LEN + tlvs_len, TLV_LEN)
@@ -83,14 +100,19 @@ def tshark_version():
 async def test_sniffer_captures(simdev_url, tmp_path):
     path = tmp_path / "capture.pcap"
 
-    stats = await capture(simdev_url, path)
+    stats = await capture(simdev_url, path, modem_time=True)
 
     data = path.read_bytes()
     _, records = read_pcap(data)
     values = [parse_tap_record(record) for _, _, record in records]
     received = [value for value in values if value[TLV_DATA_TYPE] == 2]
     errors = [value for value in values if value[TLV_DATA_TYPE] == 4]
-    assert len(records) >= 20
+    assert len(records) >= 25
+    # Every frame on air: each one ends a window early, and the fill
+    # windows cover the rest of it, up to the end of the capture.
+    times = [modem_time(value) for value in values]
+    periods = [later - earlier for earlier, later in zip(times, times[1:], strict=False)]
+    assert periods == [EMIT_PERIOD] * len(periods)
     assert len(received) + len(errors) == len(records)
     # About one frame in ten fails.
     assert 1 <= len(errors) <= len(records) // 5

@@ -36,7 +36,7 @@ nrp-sniffer --transport uart:///dev/ttyACM0 | wireshark -k -i -
 | `--channel` | 1677 | DECT NR+ carrier number |
 | `--network-id` | `0x32545279` | 32-bit network ID, decimal or `0x` hex |
 | `--rx-mode` | `single` | `single`, `semi` or `continuous`, see below |
-| `--window MS` | 20 | RX window length, fractional values accepted |
+| `--window MS` | 200 | RX window length, fractional values accepted |
 | `--depth` | 4 | RX windows queued on the device |
 | `--lead MS` | 20 | how far ahead of the device time windows are scheduled |
 | `--modem-time-tlv` | off | add the frame start modem time to each record, see below |
@@ -76,8 +76,9 @@ mode `nrp-sniffer` logs warnings and errors only. Capture filters are ignored.
 The nRF91 modem does not receive every frame format in every RX mode:
 
 - `single` (single-shot, the default): receives every format. A received frame
-  ends the window, so the rest of that window is not listened to; short
-  windows keep that uncovered remainder short.
+  (or a PDC CRC error) ends the window; `nrp-sniffer` then schedules a fill
+  window over the rest of it, from 20 ms (`--lead`) after the frame up to the
+  next queued window.
 - `continuous`: the modem cannot receive PHY header type 2 format 0 in this
   mode, the format `dectnrp-driver` sends. Use it for broadcast or format 1
   traffic.
@@ -91,18 +92,20 @@ nRF9131). A frame that starts in that transition, or too late in a window to fit
 in it, is not received. Measured on an nRF9131 EK with 1-slot frames and 20 ms
 windows, frames starting 0.3 ms before a window ends or 0.2 ms before the next
 one starts were missed. Frames starting 0.5 ms before a window ends or right at
-the start of the next one were received. That is about 0.7 ms out of every 20.4 ms (3.5 %).
+the start of the next one were received. That is about 0.7 ms per window
+boundary. These losses are not counted as gaps.
 
-These losses are not counted as gaps. With periodic traffic they come in runs:
-the 3 s period of `dectnrp-driver` lands on the window grid at only three
-phases, which drift by about 0.1 ms every three frames. A capture can then
-miss one frame in three for a while, then none for minutes. Longer windows
-make the blind time a smaller share, at the cost of a longer uncovered
-remainder after each frame in single-shot mode.
+The default 200 ms windows keep that under 0.4 % of the time. With periodic
+traffic the losses come in runs: the 3 s period of `dectnrp-driver` lands on
+the window grid at a few phases that drift slowly, so a capture can miss
+several frames in a row, then none for minutes.
+
+After a frame, the 20 ms until its fill window starts are not listened to
+either: a second frame within 20 ms of the first is missed.
 
 Windows of 3 ms or less are too short for the UART link: the host falls behind
-(the resyncs are logged as gaps) and then the device stops answering. Use
-5 ms or more.
+(the resyncs are logged as gaps), then an op insert gets no reply and the
+capture stops. Use 5 ms or more.
 
 ## Records
 
