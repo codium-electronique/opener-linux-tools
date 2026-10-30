@@ -1,5 +1,12 @@
 # Spinel M1 — device core, UART transport, host client: Implementation Plan
 
+> **Status: executed 2026-10-29** (plan written 2026-10-28), final review fix pass included. Commits, all on `spinel-ctrl` unless noted:
+> - opener: `917465f..9ab85e8` — driver commits A/B/C `0ca7a29`, `d6e04fa`, `9374b0e` (also on `driver-rx-mode`), Spinel `166defc..3108063`, driver fix `c06f7fe`, fix pass `2d95688`, `870003f`, `9ab85e8`;
+> - opener-samples: `cb735ce..c527c00` (`17ff9e3`, `302d53b`, `c527c00`);
+> - linux-tools: `81bbf03..f3f35f9` (plan amendments during execution: `c9bc9c8`, `595caf1`, `81bbf03`).
+>
+> Deviations were recorded during execution in `opener-samples/.superpowers/sdd/2026-10-28-spinel-m1-foundation/progress.md` (one `Ruling:` line each). The tasks below have been updated to what was built; "As built" notes summarise the rulings. Work after the tasks is in "After the plan" at the end.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 ## Execution mode (decided by the user)
@@ -14,7 +21,7 @@
 
 **Tech Stack:** Zephyr (NCS v3.4.0 / Zephyr 4.4), ztest + twister on `native_sim/native/64`; Python ≥ 3.11 (dev on 3.14), asyncio, pyserial, pytest + pytest-asyncio, ruff.
 
-**Spec:** `linux-tools/docs/specs/2026-10-28-opener-spinel-design.md` (sections referenced as §n below). This is plan 1 of 5 (one per spec milestone §9); plan 2 (`2026-10-28-spinel-m2-sniffer.md`) covers the sniffer. Plans 3–5 (SPI, `nrp-ping`, `nrp-hub`) are written after Task 1's risk probe and M2 land, because the probe can change D2.
+**Spec:** `linux-tools/docs/specs/2026-10-28-opener-spinel-design.md` (sections referenced as §n below). This is plan 1 of 5 (one per spec milestone §9); plan 2 (`2026-10-28-spinel-m2-sniffer.md`) covers the sniffer. Plan 3 (SPI transport on the NR+Gate) will be `2026-10-30-spinel-m3-spi.md`. Plans 4 and 5 (`nrp-ping`, `nrp-hub`) are not written yet.
 
 ## Global Constraints
 
@@ -26,9 +33,9 @@
 - Vendored sources, pinned: OpenThread `src/lib/spinel/spinel.{c,h}` @ `3d645eb9106cb1d5c2ff11891e84dc14e52e293a`; pyspinel `spinel/{codec,const,hdlc}.py` @ `5e0627abd04b7d2c7ca47c6615bd14b31227eb4d`.
 - IDs (single source of truth `opener:include/zephyr/net/dectnrp_spinel.h`, mirrored in `tools:src/opener_tools/spinel/dectnrp_constants.py`):
   - PROPs: `DRV_ENABLED 0x3D00`, `DRV_CAPS 0x3D01`, `DRV_TIME 0x3D02`, `DRV_NETWORK_ID 0x3D03`, `DRV_FILTER_SHORT_NWID 0x3D04`, `DRV_FILTER_SHORT_RXADDR 0x3D05`, `DRV_OP_QUEUE 0x3D10`, `DRV_EVENT 0x3D11`, `DRV_STATS 0x3D20`.
-  - CAPs, mirroring the property ranges: `CAP_DECTNRP_DRV 0x3D00` (15616); reserved `CAP_DECTNRP_MAC 0x3E00`, `CAP_DECTNRP_DLC 0x3F00`, `CAP_DECTNRP_CVG 0x3F80`.
-  - `STATUS_DECTNRP_ERRNO_BASE = 0x3C80` (15488). Status = base + positive errno, capped at `0x3CFF`.
-  - `INTERFACE_TYPE_DECTNRP = 0x4E52`. Protocol version 4.3.
+  - CAPs, mirroring the property ranges: `CAP_DECTNRP_DRV 0x3D00` (15616); reserved `CAP_DECTNRP_MAC 0x3E00`, `CAP_DECTNRP_DLC 0x3F00`, `CAP_DECTNRP_CVG 0x3F80`. As built: C `DECTNRP_SPINEL_CAP_{DRV,MAC,DLC,CVG}`, Python `CAP_{DRV,MAC,DLC,CVG}`.
+  - `STATUS_DECTNRP_ERRNO_BASE = 0x3C80` (15488). Status = base + positive errno, capped at `0x3CFF`. As built: C `DECTNRP_SPINEL_STATUS_ERRNO_BASE`, Python `STATUS_ERRNO_BASE` plus `STATUS_ERRNO_LAST = 0x3CFF`.
+  - `INTERFACE_TYPE_DECTNRP = 0x4E52`. Protocol version 4.3. As built: C `DECTNRP_SPINEL_INTERFACE_TYPE`, Python `INTERFACE_TYPE`.
 - Wire values (§4.5, §4.6):
   - Op type: TX 0, RX 1, RSSI1 2. Flags: bit0 scheduled, bit1 lbt, bit2 harq, bit3 beacon, bits 5..4 RX reception mode (0 single-shot, 1 semi-continuous, 2 continuous; 3 is invalid; must be 0 for TX and RSSI1). These match the driver's `enum dectnrp_rx_reception` (Task 2).
   - Event code: MSG_RECEIVED 1, MSG_ERROR 2, OP_RESULTS 3, OP_FINISHED 4. The driver enum has different values (`DECTNRP_EVENT_MSG_ERROR` = 1, `MSG_RECEIVED` = 2), so always map explicitly.
@@ -117,18 +124,18 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   
   The nRF91 driver copies `radio_mode[NRF91X1_RADIO_MODE].scheduled_operation_transition` / `.scheduled_operation_startup`, `operation.receive.idle_to_active` / `.active_to_idle_rx` / `.active_to_idle_rssi` / `.stop_to_rf_off` and `operation.transmit.idle_to_active` / `.active_to_idle` into its context in `modem_latency_get_cb`, using the radio mode it activates in `nrf91x1_start`, and `nrf91x1_get_capabilities` returns them. Fields stay 0 for drivers that do not know them, which callers treat as "unknown".
 
-- [ ] **Step 1: Create the branch and extend the probe.** Run `git -C deps/dectnrp-opener switch -c driver-rx-mode main`. Add round C to the probe: for each reception mode, one immediate RX window of 10 s on 1677, while Device2 runs `dectnrp-driver` (one type 2 format 0 frame every 3 s). Log the number of `MSG_RECEIVED`/`MSG_ERROR` events and the `OP_FINISHED` time. Until commit B exists, round C sets the modem mode with a probe-local `#ifdef` hack in the driver, which is reverted before committing.
-- [ ] **Step 2: Reproduce the bug on the unmodified driver.** Run round C in semi-continuous mode through the hack. Expect at most 1 frame per op (the second PCC is dropped as an "overrun"). Then check the stale-PCC case: the log shows `PHY_EVT_PCC overrun` after a window that ended between a PCC and its PDC, if the probe can provoke one.
-- [ ] **Step 3: Commit A.** Implement the fix, run `clang-format`, and re-run `dectnrp-driver` on both EKs: both log `SYNCHRONIZED` and print `Hello World!`. **Stop for commit A**: `drivers: dectnrp: nrf91x1: clear RX state per received message`, with a body explaining both failure modes.
-- [ ] **Step 4: Commit B.** Implement the enum, the field and the mapping; remove the probe hack. Run round C per mode and record:
+- [x] **Step 1: Create the branch and extend the probe.** Run `git -C deps/dectnrp-opener switch -c driver-rx-mode main`. Add round C to the probe: for each reception mode, one immediate RX window of 10 s on 1677, while Device2 runs `dectnrp-driver` (one type 2 format 0 frame every 3 s). Log the number of `MSG_RECEIVED`/`MSG_ERROR` events and the `OP_FINISHED` time. Until commit B exists, round C sets the modem mode with a probe-local `#ifdef` hack in the driver, which is reverted before committing. As built: the windows were 15 s.
+- [x] **Step 2: Reproduce the bug on the unmodified driver.** Done differently: `dectnrp-driver` traffic is all unicast type 2 format 0, which ends a semi-continuous window and is invisible to continuous mode, so it cannot show the bug. Reproduced instead with a throwaway type 1 broadcast peer in continuous mode: 1 of 5 frames before the fix, 5 of 5 after.
+- [x] **Step 3: Commit A.** Implement the fix, run `clang-format`, and re-run `dectnrp-driver` on both EKs: both log `SYNCHRONIZED` and print `Hello World!`. **Stop for commit A**: `drivers: dectnrp: nrf91x1: clear RX state per received message`, with a body explaining both failure modes. As built (`0ca7a29`): the commit also fixes a duplicated `HDR_STATUS_INVALID` test in `modem_pcc_received` (the second branch meant `VALID_RX_END`; such a PCC never gets a PDC, the same stale-PCC failure).
+- [x] **Step 4: Commit B.** Implement the enum, the field and the mapping; remove the probe hack. Run round C per mode and record:
   - single-shot → 1 frame, then `OP_FINISHED` right after it;
-  - semi-continuous → about 3 frames over a 10 s window;
+  - semi-continuous → about 3 frames over a 10 s window (wrong: it ends on the first unicast PDC, whatever its receiver, so it behaves like single-shot for unicast traffic);
   - continuous → expected 0 type 2 format 0 frames. Record what actually happens.
   
   Re-run the `dectnrp-driver` regression. **Decide with the user** the sniffer default: semi-continuous with 500 ms windows if it receives every frame, otherwise single-shot with 20 ms windows. Write the decision into plan 2's Global Constraints. **Stop for commit B**: `drivers: dectnrp: add RX reception mode to the driver API`.
 
-  **Done (commits A `0ca7a29`, B `d6e04fa`).** Round C, 15 s immediate windows: format 0 unicast → single-shot 1, semi-continuous 1 (ends on any unicast PDC, whatever its receiver), continuous 0; format 1 unicast (throwaway peer) → continuous 5/5; type 1 broadcast → continuous 5/5; reception 3 → `-EINVAL`. **Decision (user): sniffer default single-shot, 20 ms windows, window size configurable**, recorded in plan 2 Global Constraints.
-- [ ] **Step 4b: Commit C.**
+  **Done (commits A `0ca7a29`, B `d6e04fa`).** Round C, 15 s immediate windows: format 0 unicast → single-shot 1, semi-continuous 1 (ends on any unicast PDC, whatever its receiver), continuous 0; format 1 unicast (throwaway peer) → continuous 5/5; type 1 broadcast → continuous 5/5; reception 3 → `-EINVAL`. **Decision (user): sniffer default single-shot, 20 ms windows, window size configurable**, recorded in plan 2 Global Constraints. (Plan 2's follow-up later changed the default window to 200 ms, with fill windows.)
+- [x] **Step 4b: Commit C.**
   - Implement the latencies.
   - Extend the probe: log `get_capabilities()`, and add a round of 4 × 50 ms windows spaced by exactly `sched_op_transition`.
   - Expect the logged values to match the latencies measured in Task 1 on nRF9131, all 4 windows to run, and round G0 (0 gap) to still fail.
@@ -137,7 +144,7 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   **Stop for commit C**: `drivers: dectnrp: report modem latencies in device capabilities`.
 
   **Result:** nRF9131 LOW_LATENCY reports `sched_op_transition` 25 920, `sched_op_startup` 0, `rx_startup` 24 192, `rx_shutdown` 12 441, `rssi_shutdown` 13 824, `tx_startup` 29 030, `tx_shutdown` 7 603, `stop_to_rf_off` 14 169 ticks. 4 × 50 ms windows spaced by exactly the transition all run (spacing 1 tick shorter is also accepted); gap 0 still fails with 0x1004 then 0x1005.
-- [ ] **Step 5: Rebase.** After the user has committed A, B and C: run `git -C deps/dectnrp-opener switch spinel-ctrl && git -C deps/dectnrp-opener rebase driver-rx-mode`. Confirm that `git log --oneline main..spinel-ctrl` shows A, B and C. Pushing `driver-rx-mode` and `spinel-ctrl` to `origin` is for the user to do.
+- [x] **Step 5: Rebase.** After the user has committed A, B and C: run `git -C deps/dectnrp-opener switch spinel-ctrl && git -C deps/dectnrp-opener rebase driver-rx-mode`. Confirm that `git log --oneline main..spinel-ctrl` shows A, B and C. Pushing `driver-rx-mode` and `spinel-ctrl` to `origin` is for the user to do. As built: `spinel-ctrl` was fast-forwarded onto `driver-rx-mode` (`9374b0e`). The later driver fixes `c06f7fe` and `9ab85e8` are on `spinel-ctrl` only, not on `driver-rx-mode`.
 
 ### Task 3: Opener — subsystem skeleton, vendored codec, ID header
 
@@ -158,7 +165,7 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `DECTNRP_SPINEL_THREAD_PRIO` int 5;
   - `DECTNRP_SPINEL_RESET_TIMEOUT_MS` int 1000;
   - choice `DECTNRP_SPINEL_LEVEL`, with the single option `DECTNRP_SPINEL_LEVEL_DRIVER` (default; Spinel drives the dectnrp driver and the L2 lives on the host). Later levels add options here;
-  - choice `DECTNRP_SPINEL_TRANSPORT`: `_UART` (Task 8), `_SPI` (plan 3), `_NONE` (tests only);
+  - choice `DECTNRP_SPINEL_TRANSPORT`: `_UART` (Task 8, the default), `_SPI` (plan 3; the symbol exists but has no implementation yet, so selecting it fails at link time), `_NONE` (tests only);
   - log module `DECTNRP_SPINEL`.
 - Produces `dectnrp_spinel.h`:
   - `enum dectnrp_spinel_prop` (`DECTNRP_SPINEL_PROP_DRV_*` with the IDs above);
@@ -173,17 +180,19 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   
   Every ID has a one-line doc comment. No reference to the spec (it is not in the opener repo) nor to `doc/spinel.rst` (it lands in Task 9).
 
-- [ ] **Step 1: Vendor the codec.** Fetch `spinel.c`/`spinel.h` from `https://raw.githubusercontent.com/openthread/openthread/3d645eb9106cb1d5c2ff11891e84dc14e52e293a/src/lib/spinel/`, unmodified. Add `LICENSE`, OpenThread's BSD-3 text. Add `README.rst` stating origin, commit and "do not modify; update by re-vendoring". Add `.clang-format` containing `DisableFormat: true` and `SortIncludes: Never`, so the CI clang-format check skips these files. Build it as a `zephyr_library_named(dectnrp_spinel)` with `zephyr_library_include_directories(lib)`.
-- [ ] **Step 2: Write the failing codec test** (`ZTEST_SUITE(spinel_codec)`):
+**As built** (`166defc`): `spinel.h` stays a private include of the `dectnrp_spinel` library; each test that needs the codec adds `${ZEPHYR_OPENER_MODULE_DIR}/subsys/spinel/lib` to its own include path. `test_prop_range` casts the enum before comparing (`-Werror=enum-compare` on native_sim). `spinel.c` builds without warnings on native_sim and nRF91, so no per-file `COMPILE_OPTIONS` were needed. From Task 6 on, the codec test also builds the common mock driver (`DRV_CAPS` needs a driver's `RDCAP_*` symbols).
+
+- [x] **Step 1: Vendor the codec.** Fetch `spinel.c`/`spinel.h` from `https://raw.githubusercontent.com/openthread/openthread/3d645eb9106cb1d5c2ff11891e84dc14e52e293a/src/lib/spinel/`, unmodified. Add `LICENSE`, OpenThread's BSD-3 text. Add `README.rst` stating origin, commit and "do not modify; update by re-vendoring". Add `.clang-format` containing `DisableFormat: true` and `SortIncludes: Never`, so the CI clang-format check skips these files. Build it as a `zephyr_library_named(dectnrp_spinel)` with `zephyr_library_include_directories(lib)`.
+- [x] **Step 2: Write the failing codec test** (`ZTEST_SUITE(spinel_codec)`):
   - `test_pack_unpack_op_prefix`: pack `DECTNRP_SPINEL_FMT_OP_PREFIX` with (0x1234, 1, 1677, 0x01, 0x0102030405060708). Expect exactly 14 bytes `34 12 01 8d 06 01 08 07 06 05 04 03 02 01`. Unpacking returns the same values.
   - `test_header_byte`: `SPINEL_HEADER_FLAG | 5 == 0x85`.
   - `test_prop_range`: `DECTNRP_SPINEL_PROP_DRV_ENABLED >= SPINEL_PROP_VENDOR__BEGIN` and every PROP < `SPINEL_PROP_VENDOR__END`.
 
   `prj.conf`: `CONFIG_ZTEST=y`, `CONFIG_NETWORKING=y`, `CONFIG_NET_TEST=y`, `CONFIG_DECTNRP_DRIVER_SCHEDULED_API=y`, `CONFIG_DECTNRP_SPINEL=y`, `CONFIG_DECTNRP_SPINEL_TRANSPORT_NONE=y`. `testcase.yaml`: `tests: opener.spinel.codec: platform_allow: native_sim/native/64`.
-- [ ] **Step 3: Run it, expect a build or test FAIL**: `west twister -T deps/dectnrp-opener/tests/subsys/spinel/codec -p native_sim/native/64`
-- [ ] **Step 4: Add the header, Kconfig and CMake until the test passes.** If `spinel.c` triggers warnings under Zephyr's flags, silence them per file with `set_source_files_properties(... COMPILE_OPTIONS ...)`, never by editing the file.
-- [ ] **Step 5: Run the test, expect PASS.**
-- [ ] **Step 6: Commit** in opener: `feat(spinel): add subsystem skeleton and vendored OpenThread codec`.
+- [x] **Step 3: Run it, expect a build or test FAIL**: `west twister -T deps/dectnrp-opener/tests/subsys/spinel/codec -p native_sim/native/64`
+- [x] **Step 4: Add the header, Kconfig and CMake until the test passes.** If `spinel.c` triggers warnings under Zephyr's flags, silence them per file with `set_source_files_properties(... COMPILE_OPTIONS ...)`, never by editing the file. (Not needed: no warnings. `lib/README.rst` still claims per-file silencing, a deferred minor finding.)
+- [x] **Step 5: Run the test, expect PASS.**
+- [x] **Step 6: Commit** in opener: `feat(spinel): add subsystem skeleton and vendored OpenThread codec`.
 
 ### Task 4: Opener — HDLC-lite encoder / decoder
 
@@ -200,7 +209,9 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `SPINEL_HDLC_MAX_ENCODED(len)` = `2*(len+2)+2`.
 - FCS = CRC-16/X-25: `~crc16_ccitt(0xffff, data, len)`, appended little-endian. Escape `0x7E 0x7D 0x11 0x13 0xF8` as `0x7D, b^0x20` (§5.4).
 
-- [ ] **Step 1: Write the failing tests:**
+**As built** (`21d3a92`, style pass `31b5651`): `hdlc.c` is built only with `CONFIG_DECTNRP_SPINEL_TRANSPORT_UART`; the hdlc test compiles it directly and adds `subsys/spinel` to its include path. `hdlc.h` has no standalone FCS function, so `test_fcs_check_value` checks the FCS bytes `6E 90` in the encoder output for `"123456789"`. Garbage without a flag is closed by the next frame's leading flag and reported once as `-EBADMSG`, then the frame decodes; `test_garbage_then_frame` asserts that. The style pass named the escaped bytes (`HDLC_XON`/`XOFF`/`VENDOR`) and made the code more explicit.
+
+- [x] **Step 1: Write the failing tests:**
   - `test_fcs_check_value`: the X-25 FCS of `"123456789"` is `0x906E`.
   - `test_encode_escapes`: encoding `{0x7E, 0x11, 0x42}` gives `7E 7D 5E 7D 31 42 <fcs lo> <fcs hi> 7E`, with the FCS bytes escaped if needed.
   - `test_roundtrip_all_bytes`: a 256-byte frame 0..255 encodes, then decodes byte by byte to the same frame.
@@ -208,10 +219,10 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `test_garbage_then_frame`: random bytes without a flag, then a valid frame, decodes the frame.
   - `test_overflow_resync`: a frame of `size+10` bytes gives `-EMSGSIZE` once, and the following valid frame decodes.
   - `test_empty_frames_ignored`: `7E 7E 7E` yields nothing.
-- [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement `hdlc.c`.**
-- [ ] **Step 4: Run, expect PASS.**
-- [ ] **Step 5: Commit** `feat(spinel): add HDLC-lite framing`.
+- [x] **Step 2: Run, expect FAIL.**
+- [x] **Step 3: Implement `hdlc.c`.**
+- [x] **Step 4: Run, expect PASS.**
+- [x] **Step 5: Commit** `feat(spinel): add HDLC-lite framing`.
 
 ### Task 5: Opener — driver-level L2 registration and test mock driver
 
@@ -221,12 +232,14 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
 - Test: `opener:tests/subsys/spinel/mock/…`
 
 **Interfaces:**
-- `l2.c` provides what the samples currently define themselves (see `samples:samples/dectnrp-driver/src/dectnrp.c:196-223`): `NET_L2_INIT(DECTNRP_L2, …)` with `recv` → `NET_DROP`, `send` → `-ENOTSUP`, `enable` → 0, `flags` → 0; and `void dectnrp_l2_init(struct net_if *iface)`, which only sets `ctx->iface`. File comment: at driver level the L2 lives on the Spinel host, so the Spinel interface owns the device-side L2 hook (spec D10).
+- `l2.c` provides what the samples currently define themselves (see `samples:samples/dectnrp-driver/src/dectnrp.c:196-223`): `NET_L2_INIT(DECTNRP_L2, …)` with `recv` → `NET_DROP`, `send` → `-ENOTSUP`, `enable` → 0, `flags` → 0; and `void dectnrp_l2_init(struct net_if *iface)`, which sets `ctx->iface` and also `NET_IF_NO_AUTO_START` (as built: with no link address, the boot-time `net_if_up` hits `NET_ASSERT(link_addr len > 0)`; the iface staying DOWN matches the driver API's initial state, and the host starts the radio). File comment: at driver level the L2 lives on the Spinel host, so the Spinel interface owns the device-side L2 hook. As built, it does not cite spec D10 (the spec is not in the opener repo).
 - `Kconfig.mock` (rsourced by each test's `Kconfig`, together with `source "Kconfig.zephyr"`):
   - `DECTNRP_DRIVER_MOCK` bool;
   - the `DECTNRP_DRIVER_RDCAP_*` ints with the nRF91 defaults (release 1, power class 2, NSS 1, diversity 1, rxgain −4, MCS 4, softbuffer 25344, HARQ 8, feedback delay 2, mu 1, beta 1);
   - `DECTNRP_DRIVER_MODEMTICKS_PER_SYMBOL` 2880;
   - `DECTNRP_DRIVER_MOCK_AUTO` bool (Task 8), with `_EMIT_PERIOD_MS` int 100.
+  
+  As built: the `RDCAP`/`MODEMTICKS` symbols and `MOCK_AUTO` live under `if DECTNRP_DRIVER_MOCK`.
 - `mock_driver.h`:
   - `struct mock_driver { bool started; int start_calls, stop_calls; uint32_t network_id; bool nwid_filter; uint8_t nwid; bool rxaddr_filter; uint16_t rxaddr; dectnrp_driver_event_cb_t cb; struct dectnrp_driver_op *ops[16]; size_t n_ops; int schedule_ret; int start_ret; net_time_t time; }`;
   - `struct mock_driver *mock_driver_get(void)`;
@@ -234,16 +247,16 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `struct net_if *mock_driver_iface(void)`;
   - `void mock_driver_emit(const struct dectnrp_driver_event *evt)`, which calls `cb(iface, evt)`.
 
-  `stop()` emits `OP_FINISHED` for every recorded op still unfinished, matching nRF91 cancel-all. `get_time` returns `time` when non-zero, else `k_uptime_get() * 69120`. `get_hw_capabilities` returns `DECTNRP_HW_FILTER | DECTNRP_HW_TXTIME | DECTNRP_HW_RXTIME`, and `get_capabilities` returns the same `hw_caps` with the nRF9131 latencies (25920, 0, 24192, 12441, 13824, 29030, 7603, 14169 in field order). Created with `NET_DEVICE_INIT(…, DECTNRP_L2, NET_L2_GET_CTX_TYPE(DECTNRP_L2), DECTNRP_MTU)`, and `iface_api.init` calls `dectnrp_l2_init()` like the nRF91 driver.
+  `stop()` emits `OP_FINISHED` for every recorded op still unfinished, matching nRF91 cancel-all. `get_time` returns `time` when non-zero, else `k_uptime_get() * 69120`. `get_hw_capabilities` returns `DECTNRP_HW_FILTER | DECTNRP_HW_TXTIME | DECTNRP_HW_RXTIME`, and `get_capabilities` returns the same `hw_caps` with the nRF9131 latencies (25920, 0, 24192, 12441, 13824, 29030, 7603, 14169 in field order). Created with `NET_DEVICE_INIT(…, DECTNRP_L2, NET_L2_GET_CTX_TYPE(DECTNRP_L2), DECTNRP_MTU)`, and `iface_api.init` calls `dectnrp_l2_init()` like the nRF91 driver. As built: `schedule()` returns `-ENOMEM` when its 16 op slots are full; the mock test's `prj.conf` enables `CONFIG_ASSERT`. With Spinel at driver level, an app that defines its own DECTNRP L2 (the `dectnrp-driver` sample) now gets duplicate symbols, as D10 intends.
 
-- [ ] **Step 1: Write the failing tests** (`ZTEST_SUITE(spinel_mock)`):
+- [x] **Step 1: Write the failing tests** (`ZTEST_SUITE(spinel_mock)`):
   - `test_iface_found`: `net_if_get_first_by_type(&NET_L2_GET_NAME(DECTNRP)) == mock_driver_iface()`.
   - `test_schedule_records`: calling `schedule()` through the API records the op.
   - `test_stop_finishes_ops`: a registered cb sees one `OP_FINISHED` per recorded op after `stop()`.
-- [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run, expect PASS.**
-- [ ] **Step 5: Commit** `feat(spinel): register the DECTNRP L2 and add a test mock driver`.
+- [x] **Step 2: Run, expect FAIL.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run, expect PASS.**
+- [x] **Step 5: Commit** `feat(spinel): register the DECTNRP L2 and add a test mock driver`.
 
 ### Task 6: Opener — core: threads, dispatch, identity and driver properties
 
@@ -270,15 +283,22 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - Dispatch: header must have `FLG=0b10` and `IID=0`, otherwise drop and count `FRAMES_REJECTED`. `CMD_NOOP` → `LAST_STATUS OK`. `CMD_RESET` → Task 7 hook (here: stop the driver, send `LAST_STATUS RESET_SOFTWARE` with TID 0). GET/SET of the props below. `INSERT` → Task 7. Any other command → `INVALID_COMMAND`. Unknown prop → `PROP_NOT_FOUND`. Unpack failure → `PARSE_ERROR`.
   - Identity (§4.2):
     - `PROTOCOL_VERSION` `ii` 4,3;
-    - `NCP_VERSION` `U` `"OPENER/<APP_VERSION_STRING or KERNEL_VERSION_STRING>; <dev->name>; " __DATE__`;
+    - `NCP_VERSION` `U` `"OPENER/<major>.<minor>.<patch>-<commit>[+]; <dev->name>; " __DATE__`. As built, the version comes from the Opener module's generated `<opener/build_info.h>` (spec §4.2 asks for the Opener version), not from `APP/KERNEL_VERSION_STRING`; `dectnrp_spinel` depends on `opener_build_info_h`, with the fallback `"OPENER/unknown; …"`;
     - `INTERFACE_TYPE` `i` 0x4E52;
     - `VENDOR_ID` `i` 0;
     - `CAPS` = packed `i` list `[CAP_DECTNRP_DRV]`;
     - `LAST_STATUS` get → OK.
   - Driver props (§4.4). `DRV_ENABLED` set calls `start`/`stop`, treating `-EALREADY` as success, and replies `IS` with the new state. The filter/network-ID getters return the cached last-set values (initial: 0, inactive). `DRV_CAPS` packs, in order: `get_capabilities().hw_caps`; the `CONFIG_DECTNRP_DRIVER_RDCAP_*` values; `CONFIG_DECTNRP_DRIVER_MODEMTICKS_PER_SYMBOL`; `CONFIG_DECTNRP_SPINEL_MAX_FRAME_SIZE`; `CONFIG_DECTNRP_SPINEL_OP_SLOTS`; then the eight latencies from `get_capabilities()` in struct order (`sched_op_transition`, `sched_op_startup`, `rx_startup`, `rx_shutdown`, `rssi_shutdown`, `tx_startup`, `tx_shutdown`, `stop_to_rf_off`).
 
-- [ ] **Step 1: Write the failing tests** (`ZTEST_SUITE(spinel_core)`; the `before` hook calls `mock_driver_reset()` and drains `spinel_test_recv`). Helpers `send_req(tid, cmd, prop, fmt, …)` and `recv_reply(&tid, &cmd, &prop, &payload, &len)` use `spinel_datatype_pack/unpack`.
-  - `test_boot_reset_notification`: the first frame ever received is TID 0 `PROP_VALUE_IS LAST_STATUS RESET_POWER_ON`. This suite must run first; name it `test_00_…`.
+**As built** (`e9ce4b3`, with the style pass `31b5651`):
+- The RX and TX threads are created with `k_thread_create()` in `spinel_init()`, not `K_THREAD_DEFINE`: static threads only start after the `APPLICATION` `SYS_INIT`, so starting them from init was a no-op (found by `test_00_…`).
+- The codec and hdlc tests also use the common mock driver (`Kconfig` + `CMakeLists.inc` + `CONFIG_DECTNRP_DRIVER_MOCK=y`), because `DRV_CAPS` reads `CONFIG_DECTNRP_DRIVER_RDCAP_*` and a Spinel build without a driver no longer compiles. The "no iface" startup path stays but no test exercises it.
+- Until Task 7, `INSERT` replied `PROP_NOT_FOUND` and the event handler was a placeholder. SET of a read-only or unknown prop → `PROP_NOT_FOUND`. `FRAMES_RX` counts every frame dispatched; an oversize frame in `spinel_rx_submit` → `FRAMES_REJECTED`; a transport send failure → `TRANSPORT_ERRORS`.
+- The boot notification is captured in the suite setup, before the `before` hook drains the queue. Extra test `test_ncp_version`.
+- Style pass (user request): explicit locals, no chained calls, ternaries or calls inside asserts; `prop_set` split into `set_prop_*` helpers returning a status.
+
+- [x] **Step 1: Write the failing tests** (`ZTEST_SUITE(spinel_core)`; the `before` hook calls `mock_driver_reset()` and drains `spinel_test_recv`). Helpers `send_req(tid, cmd, prop, fmt, …)` and `recv_reply(&tid, &cmd, &prop, &payload, &len)` use `spinel_datatype_pack/unpack`.
+  - `test_00_boot_reset_notification`: the first frame ever received is TID 0 `PROP_VALUE_IS LAST_STATUS RESET_POWER_ON`. This suite must run first; name it `test_00_…`.
   - `test_noop`: TID 3 → reply TID 3, `LAST_STATUS OK`.
   - `test_protocol_version`: values 4, 3.
   - `test_interface_type`: 0x4E52.
@@ -293,10 +313,11 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `test_truncated_set`: set `DRV_NETWORK_ID` with a 2-byte value → `PARSE_ERROR`.
   - `test_bad_header_ignored`: a frame with header 0x45 → no reply within 50 ms, and `FRAMES_REJECTED` incremented (read through `DRV_STATS`).
   - `test_driver_errno_status`: `start_ret = -EIO` → status `0x3C80 + EIO`.
-- [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement.** RX thread: `k_fifo_get` → dispatch → `net_buf_unref`. TX thread: `k_fifo_get` → `spinel_transport_send` → `net_buf_unref`. Use `NET_BUF_POOL_DEFINE` pools for RX, TX and events, each with data size `CONFIG_DECTNRP_SPINEL_MAX_FRAME_SIZE`.
-- [ ] **Step 4: Run, expect PASS.**
-- [ ] **Step 5: Commit** `feat(spinel): add core dispatch and driver-level properties`.
+  - Added in the fix pass (`870003f`): `test_reset_clears_filters`.
+- [x] **Step 2: Run, expect FAIL.**
+- [x] **Step 3: Implement.** RX thread: `k_fifo_get` → dispatch → `net_buf_unref`. TX thread: `k_fifo_get` → `spinel_transport_send` → `net_buf_unref`. Use `NET_BUF_POOL_DEFINE` pools for RX, TX and events, each with data size `CONFIG_DECTNRP_SPINEL_MAX_FRAME_SIZE`.
+- [x] **Step 4: Run, expect PASS.**
+- [x] **Step 5: Commit** `feat(spinel): add core dispatch and driver-level properties`.
 
 ### Task 7: Opener — op broker: slots, `DRV_OP_QUEUE`, event forwarding, reset
 
@@ -307,12 +328,13 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
 
 **Interfaces:**
 - Internal API:
-  - `int spinel_ops_insert(uint8_t tid, const uint8_t *value, size_t len)`. It replies itself: `INSERTED(DRV_OP_QUEUE, "S" token)` on success, `LAST_STATUS` otherwise;
+  - `void spinel_ops_insert(uint8_t tid, const uint8_t *value, size_t len)` (as built `void`: it always replies itself: `INSERTED(DRV_OP_QUEUE, "S" token)` on success, `LAST_STATUS` otherwise);
   - `void spinel_ops_event_cb(struct net_if *iface, const struct dectnrp_driver_event *evt)` (the registered driver handler);
-  - `int spinel_ops_reset(k_timeout_t timeout)`: `stop()`, then wait until all slots are free, then force-free stragglers and log a warning;
+  - `int spinel_ops_reset(k_timeout_t timeout)`: wait until all slots are free, then force-free stragglers (`-ETIMEDOUT`) and log a warning. As built, it does not call `stop()`: `cmd_reset` stops the driver through `set_drv_enabled(false)`, so the cached `DRV_ENABLED` stays consistent, then calls `spinel_ops_reset()`;
   - `size_t spinel_ops_in_flight(void)`.
-- `struct spinel_op_slot`: `bool used`, `uint16_t token`, `struct dectnrp_driver_op op`, `struct dectnrp_rssi1_result rssi1`. Find a slot from an event's op with `CONTAINER_OF(op, struct spinel_op_slot, op)`.
-- TX ops: allocate a `net_pkt` holding `data` with `net_pkt_alloc_with_buffer(iface, len, AF_UNSPEC, 0, K_NO_WAIT)` + `net_pkt_write`. Unref it when the slot is released, as `samples:…/dectnrp_operation.c:dectnrp_free_operation` does. Validate `len ≥ PCC size for phy_header_type` (5 or 10) and `len ≤ PCC + DECTNRP_MTU`. Otherwise `INVALID_ARGUMENT`.
+- `struct spinel_op_slot`: `bool used`, `bool finished` (later events of the op are ignored, no second `OP_FINISHED`), `uint16_t token`, `uint32_t generation` (bumped at release and stored with the `OP_FINISHED` buffer, so a stale buffer after a forced reset cannot free the slot's next op), `struct dectnrp_driver_op op`, `struct dectnrp_rssi1_result rssi1`. As built, a slot is found from an event's op by scanning the slot array, not with `CONTAINER_OF`, so an op pointer that is not ours is rejected.
+- TX ops: allocate a `net_pkt` holding `data` with `net_pkt_alloc_with_buffer(iface, len, NET_AF_UNSPEC, 0, K_NO_WAIT)` + `net_pkt_write`. Unref it when the slot is released, as `samples:…/dectnrp_operation.c:dectnrp_free_operation` does. Validate `len ≥ PCC size for phy_header_type` (5 or 10) and `len ≤ PCC + DECTNRP_MTU`. Otherwise `INVALID_ARGUMENT`. Fix pass (`2d95688`): data that does not fit one `net_buf` is also `INVALID_ARGUMENT` (the nRF91 driver sends `op->tx.pkt->buffer` as one fragment, so it was silently truncated).
+- Op flags are checked per type (as built): LBT/HARQ only on TX, BEACON on TX and RX, reception bits only on RX; unknown bits → `INVALID_ARGUMENT`.
 - Events (§4.6, §5.3): packed directly in the callback into an event-pool buffer (`K_NO_WAIT`), header TID 0, `CMD_PROP_VALUE_IS`, `DRV_EVENT`, prefix `SClS` (token, wire code, status, dropped).
   - `dropped` = `atomic_set(&pending_drops, 0)`, saturated to 0xFFFF.
   - On pool exhaustion: `atomic_inc(&pending_drops)` and `EVENTS_DROPPED++`.
@@ -321,11 +343,12 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `OP_RESULTS` packs the slot's `rssi1.channel` and `DECTNRP_SUBSLOTS_PER_FRAME` bytes.
   - `channel` in every event = `slot->op.channel`.
 
-- [ ] **Step 1: Write the failing tests** (`ZTEST_SUITE(spinel_ops)`):
+- [x] **Step 1: Write the failing tests** (`ZTEST_SUITE(spinel_ops)`):
   - `test_insert_rx_scheduled`: insert token 7, RX, ch 1677, flags 1, start 1000, duration 691200, rssi 0. Expect `INSERTED` with token 7, and the mock op has `type RX`, `rx.mode.is_scheduled 1`, `start_time 1000`, `rx.duration 691200`, `channel 1677`.
   - `test_insert_rx_reception`: flags `0x1 | (1 << 4)` → `rx.mode.reception == DECTNRP_RX_RECEPTION_SEMICONTINUOUS`. Reception 3 → `INVALID_ARGUMENT`. Reception bits set on a TX op → `INVALID_ARGUMENT`.
   - `test_insert_tx`: data `[5-byte PCC]"Hello World!"`. The mock op's `tx.pkt` holds 17 bytes and the transport params match.
   - `test_insert_tx_too_short`: 3 bytes of data → `INVALID_ARGUMENT`, and no op scheduled.
+  - Added in the fix pass (`2d95688`): `test_insert_tx_larger_than_net_buf` → `INVALID_ARGUMENT`.
   - `test_duplicate_token`: second insert of token 7 while in flight → `ALREADY`.
   - `test_slots_exhausted`: insert 8 ops, then the 9th → `NOMEM`.
   - `test_schedule_error`: `schedule_ret = -EBUSY` → `BUSY`, and the slot is not leaked (the next insert succeeds).
@@ -335,10 +358,10 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `test_finished_frees_slot`: after `OP_FINISHED` is received by the test transport, `spinel_ops_in_flight() == 0` and token 7 can be reused.
   - `test_event_pool_exhaustion`: block the TX thread (the test transport `send` waits on a semaphore), then emit `CONFIG_DECTNRP_SPINEL_EVENT_BUFS + 5` `MSG_RECEIVED` and one `OP_FINISHED`; then unblock. Expect: exactly `EVENT_BUFS` `MSG_RECEIVED` delivered, the `OP_FINISHED` is delivered with `dropped == 5`, `DRV_STATS` events_dropped == 5, and the slot is freed.
   - `test_reset_with_ops_in_flight`: 3 ops in flight, then `CMD_RESET`. Expect `mock->stop_calls == 1`, three `OP_FINISHED`, then `LAST_STATUS RESET_SOFTWARE` TID 0, and in-flight 0.
-- [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement.** Make the test transport's blocking `send` hook a `none.c` test API: `void spinel_test_block_tx(bool block)`.
-- [ ] **Step 4: Run, expect PASS.** Also rerun the `core` suite.
-- [ ] **Step 5: Commit** `feat(spinel): add op broker and driver event forwarding`.
+- [x] **Step 2: Run, expect FAIL.**
+- [x] **Step 3: Implement.** Make the test transport's blocking `send` hook a `none.c` test API: `void spinel_test_block_tx(bool block)`. As built: the request/reply helpers moved from the core test to `opener:tests/subsys/spinel/common/spinel_client.{c,h}` (+ `CMakeLists.client.inc`), shared by the core and ops suites; the ops suite consumes the boot notification in its setup.
+- [x] **Step 4: Run, expect PASS.** Also rerun the `core` suite.
+- [x] **Step 5: Commit** `feat(spinel): add op broker and driver event forwarding`.
 
 ### Task 8: Opener — UART HDLC transport and native_sim simulated device
 
@@ -348,24 +371,25 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
 - Modify: `opener:tests/subsys/spinel/common/mock_driver.c` (auto mode)
 
 **Interfaces:**
-- `DECTNRP_SPINEL_TRANSPORT_UART` depends on `$(dt_chosen_enabled,opener,spinel-uart)` and selects `SERIAL` and `UART_INTERRUPT_DRIVEN`. Behaviour:
+- `DECTNRP_SPINEL_TRANSPORT_UART` depends on `$(dt_chosen_enabled,$(DT_CHOSEN_SPINEL_UART))` with `DT_CHOSEN_SPINEL_UART := opener,spinel-uart` (the comma would split the macro arguments) and selects `SERIAL` and `UART_INTERRUPT_DRIVEN`. Behaviour:
   - Interrupt-driven RX feeds `spinel_hdlc_decode_byte` in ISR context, with the decoder buffer sized `CONFIG_DECTNRP_SPINEL_MAX_FRAME_SIZE`. A complete frame goes to `spinel_rx_submit`. `-EBADMSG`/`-EMSGSIZE` → `spinel_stat_inc(FRAMES_REJECTED)`.
-  - `spinel_transport_send` HDLC-encodes into a static buffer of `SPINEL_HDLC_MAX_ENCODED(MAX_FRAME_SIZE)` and transmits it via an IRQ-driven TX with a `k_sem` for completion.
+  - `spinel_transport_send` HDLC-encodes into a static buffer of `SPINEL_HDLC_MAX_ENCODED(MAX_FRAME_SIZE)` and transmits it via an IRQ-driven TX with a `k_sem` for completion. As built, it waits at most 1 s per frame (`UART_TX_TIMEOUT`) and returns `-EIO`, counted as `TRANSPORT_ERRORS`, so a UART nobody drains cannot block the TX thread forever.
 - Mock auto mode (`CONFIG_DECTNRP_DRIVER_MOCK_AUTO`), simulating the nRF91 for host integration tests:
   - Time = `k_uptime_get() * 69120`.
   - An RX op becomes active at `start_time` (immediately if not scheduled) and emits `OP_FINISHED` at `start + duration`.
   - Every `EMIT_PERIOD_MS`, if an RX window is active, emit one canned frame. A single-shot op then finishes early (as found in Task 1). Semi-continuous and continuous ops keep running until their end. Every 10th canned frame is a `MSG_ERROR` with `DECTNRP_ERROR_PDC_CRC` (pcc valid). The others are `MSG_RECEIVED` with phy_type 1 and PCC = the 10-byte type 2 format 0 header `dectnrp-driver` sends (`samples:samples/dectnrp-driver/src/dectnrp_mac_helper.c` `frame[0..9]`). For simplicity the PDC is just `"Hello World!"`. rssi2 0x50, snr 20.
   - TX → `OP_FINISHED` after 1 ms. RSSI1 → `OP_RESULTS` with all subslots 0x60, then `OP_FINISHED`.
   - Implemented with one `k_work_delayable` per recorded op.
+  - As built: auto mode keeps its own table of entries (`auto_ops`), recycled when an op finishes, instead of recording in `mock.ops`, so a long-running simdev never hits the 16-op limit. Frames sit on a global uptime grid (k × `EMIT_PERIOD_MS`), and every 10th grid index is the `MSG_ERROR`. The work handler is time-driven under a mutex, so early or late runs are harmless. A single-shot RX finishes after any frame, `MSG_ERROR` included.
 - simdev:
-  - `app.overlay`: `chosen { opener,spinel-uart = &uart1; }`.
-  - `prj.conf`: `CONFIG_DECTNRP_SPINEL_TRANSPORT_UART=y`, `CONFIG_DECTNRP_DRIVER_MOCK=y`, `CONFIG_DECTNRP_DRIVER_MOCK_AUTO=y`, `CONFIG_NATIVE_SIM_SLOWDOWN_TO_REAL_TIME=y`, `CONFIG_UART_NATIVE_PTY_1=y` if that symbol exists in this Zephyr (check `drivers/serial/Kconfig.native_pty`).
+  - `app.overlay`: `chosen { opener,spinel-uart = &uart1; }` and `&uart1 { status = "okay"; }`.
+  - `prj.conf`: `CONFIG_DECTNRP_SPINEL_TRANSPORT_UART=y`, `CONFIG_DECTNRP_DRIVER_MOCK=y`, `CONFIG_DECTNRP_DRIVER_MOCK_AUTO=y`, `CONFIG_NATIVE_SIM_SLOWDOWN_TO_REAL_TIME=y`. Zephyr 4.4 has no `UART_NATIVE_PTY_1` symbol; the overlay enables uart1 instead.
   - `main.c` is empty: the subsystem self-starts.
   - `testcase.yaml`: `build_only: true` (it is a fixture for host tests).
 
-- [ ] **Step 1: Build the simdev, expect FAIL** (no transport yet): `west build -p -b native_sim/native/64 -d build/simdev deps/dectnrp-opener/tests/subsys/spinel/simdev`
-- [ ] **Step 2: Implement the UART transport and the mock auto mode.**
-- [ ] **Step 3: Smoke-test against the pty.** Run `build/simdev/zephyr/zephyr.exe`. It prints the `/dev/pts/N` of uart1; note the exact line format, which Task 13 parses. Then send an HDLC-encoded `CMD_PROP_VALUE_GET(PROTOCOL_VERSION)` and decode the reply:
+- [x] **Step 1: Build the simdev, expect FAIL** (no transport yet): `west build -p -b native_sim/native/64 -d build/simdev deps/dectnrp-opener/tests/subsys/spinel/simdev`
+- [x] **Step 2: Implement the UART transport and the mock auto mode.**
+- [x] **Step 3: Smoke-test against the pty.** Run `build/simdev/simdev/zephyr/zephyr.exe` (sysbuild puts the image in a subfolder named after the app). It prints the `/dev/pts/N` of uart1; note the exact line format, which Task 13 parses. Then send an HDLC-encoded `CMD_PROP_VALUE_GET(PROTOCOL_VERSION)` and decode the reply:
   ```bash
   python3 - /dev/pts/N <<'EOF'
   import sys, serial, binascii
@@ -383,27 +407,29 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   EOF
   ```
   Expected: the boot frame `…80 06 00 70…`, then `7e 81 06 01 04 03 <fcs> 7e`.
-- [ ] **Step 4: Run all Spinel suites, expect PASS**: `west twister -T deps/dectnrp-opener/tests/subsys/spinel -p native_sim/native/64`
-- [ ] **Step 5: Commit** `feat(spinel): add UART HDLC transport and native_sim simulated device`.
+
+  Result: reply `7e 81 06 01 04 03 db 0a 7e`. The pty line is `uart_1 connected to pseudotty: /dev/pts/N` (uart0 prints `uart connected to pseudotty: …` first). The boot `LAST_STATUS` frame is lost, because it is written before the host opens the pty: the host must not wait for it and syncs with `CMD_RESET`. A burst of more than `CONFIG_DECTNRP_SPINEL_RX_BUFS` (4) frames drops the extras (counted in `TRANSPORT_ERRORS`, no reply), so the host must keep at most 4 requests outstanding. Also checked: continuous RX 350 ms → 4 `MSG_RECEIVED` + `OP_FINISHED`; RSSI1 → `OP_RESULTS` 48 × 0x60 + `OP_FINISHED`; TX → `OP_FINISHED`.
+- [x] **Step 4: Run all Spinel suites, expect PASS**: `west twister -T deps/dectnrp-opener/tests/subsys/spinel -p native_sim/native/64`
+- [x] **Step 5: Commit** `feat(spinel): add UART HDLC transport and native_sim simulated device`.
 
 ### Task 9: Firmware sample and protocol documentation
 
 **Files:**
 - Create: `samples:samples/dectnrp-spinel/{CMakeLists.txt,prj.conf,sample.yaml,README.rst,src/main.c,boards/nrf9151dk_nrf9151_ns.{conf,overlay},boards/nrf9131ek_nrf9131_ns.{conf,overlay}}`. The overlay includes the same `nrf91x1_partition_without_bootloader.dtsi` / `nrf91x1_dect_modem.dtsi` as `dectnrp-driver`; copy them into `boards/`.
-- Create: `opener:doc/spinel.rst`; Modify: the opener doc index (toctree that lists the driver docs).
+- Create: `opener:doc/spinel.rst`; Modify: `opener:doc/index.rst` (the opener docs have no driver toctree: `spinel` was added to the root toctree, between `build` and `api`).
 
 **Interfaces:**
 - Sample:
-  - `prj.conf` = `dectnrp-driver`'s minus the sample-specific symbols, plus `CONFIG_DECTNRP_SPINEL=y`, `CONFIG_DECTNRP_SPINEL_TRANSPORT_UART=y`.
-  - DK and EK overlays: `chosen { opener,spinel-uart = &uart0; };` with `&uart0 { current-speed = <1000000>; }`. Logs go on RTT, and the console moves off uart0: `CONFIG_UART_CONSOLE=n`, `CONFIG_LOG_BACKEND_UART=n`.
+  - `prj.conf` = `dectnrp-driver`'s minus the sample-specific symbols, plus `CONFIG_DECTNRP_SPINEL=y`, `CONFIG_DECTNRP_SPINEL_TRANSPORT_UART=y`. As built, it also drops `NET_L2_DUMMY`, `HWINFO`, `SAMPLE_*` (Spinel registers the DECTNRP L2) and `NCS_APPLICATION_BOOT_BANNER_STRING`, and adds `CONFIG_RTT_CONSOLE=y`. It sets `CONFIG_NET_BUF_DATA_SIZE=1034` (PCC type 2 + MTU, so a TX fits one `net_buf`), `NET_BUF_TX_COUNT`/`NET_PKT_TX_COUNT` 8 (= op slots) and the RX counts 2, instead of the experimental `NET_BUF_VARIABLE_DATA_SIZE` (RAM 76 KB of 128 KB). The board `.conf` files hold only the modem symbols.
+  - DK and EK overlays: `chosen { opener,spinel-uart = &uart0; };` with `&uart0 { current-speed = <1000000>; }`. Logs go on RTT, and the console moves off uart0: `CONFIG_UART_CONSOLE=n`, `CONFIG_LOG_BACKEND_UART=n`. (Plan 2 added `hw-flow-control` to uart0, `efc3202`.)
   - `main.c` logs a banner and returns.
   - `sample.yaml` scenario `sample.dectnrp_spinel` on `nrf9151dk/nrf9151/ns`.
-- `doc/spinel.rst`: §4 of the spec turned into reference documentation: framing, identity, ranges, property table, op and event layouts, the reset/OP_FINISHED guarantee. Also the DK quick start, and the deviation notes (IRQ polarity and BUSY are documented in plan 3).
+- `doc/spinel.rst`: §4 of the spec turned into reference documentation: framing, identity, ranges, property table, op and event layouts, the reset/OP_FINISHED guarantee. Also the DK quick start, and the deviation notes (IRQ polarity and BUSY are documented in plan 3). As built, it also documents where the implementation refines the spec: errno vendor statuses `0x3C80 + errno` capped at `0x3CFF`, the `CMD_RESET` notification on TID 0, SET replying `IS` with the value in effect, host pacing ≤ `RX_BUFS` and `CMD_RESET` to sync. No SPI/IRQ/BUSY section (plan 3).
 - `dectnrp_spinel.h`: once `doc/spinel.rst` exists, the file comment points to it as the protocol reference.
 
-- [ ] **Step 1: Build both targets, expect PASS**: `west build -p -b nrf9151dk/nrf9151/ns -d build/nrf9151dk/nrf9151/ns/dectnrp-spinel samples/dectnrp-spinel`, and the same with `nrf9131ek/nrf9131/ns` into `build/nrf9131ek/nrf9131/ns/dectnrp-spinel`. Check that `build/.../zephyr/.config` has `CONFIG_DECTNRP_SPINEL_TRANSPORT_UART=y` .
-- [ ] **Step 2: Build the docs, expect no new warnings** (command in CLAUDE.md "Building the stack's docs").
-- [ ] **Step 3: Commit** in opener-samples `samples: add dectnrp-spinel firmware`, and in opener `doc: add Spinel interface specification`.
+- [x] **Step 1: Build both targets, expect PASS**: `west build -p -b nrf9151dk/nrf9151/ns -d build/nrf9151dk/nrf9151/ns/dectnrp-spinel samples/dectnrp-spinel`, and the same with `nrf9131ek/nrf9131/ns` into `build/nrf9131ek/nrf9131/ns/dectnrp-spinel`. Check that `build/.../zephyr/.config` has `CONFIG_DECTNRP_SPINEL_TRANSPORT_UART=y` .
+- [x] **Step 2: Build the docs, expect no new warnings** (command in CLAUDE.md "Building the stack's docs"). Result: the docs build already fails under `-W` on 7 pre-existing `dectnrp.h` warnings; this task adds none (diffed against a baseline build). Both firmware builds pass; the only warning is the experimental `NRF_MODEM_LINK_BINARY_DECT_PHY`, as for `dectnrp-driver`. Not run on hardware in this task.
+- [x] **Step 3: Commit** in opener-samples `samples: add dectnrp-spinel firmware`, and in opener `doc: add Spinel interface specification`.
 
 ### Task 10: linux-tools — package skeleton, vendored codec, HDLC, constants
 
@@ -419,18 +445,20 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - scripts are added by later tasks;
   - `[tool.pytest.ini_options] asyncio_mode="auto"`, `markers = ["hw: needs hardware (--transport)", "simdev: needs OPENER_SIMDEV_EXE"]`;
   - ruff line-length 100, `extend-exclude` the vendored `codec.py`/`const.py` from formatting only.
-- `codec.py`: pyspinel's `SpinelCodec` class only (pyspinel `codec.py` lines 74–417: `parse_*`, `parse_field(s)`, `encode_*`, `encode_fields`, `encode_packet`), imports reduced to `struct`. `const.py`: the `SPINEL` class only. Record the modifications in the vendored header.
+- `codec.py`: pyspinel's `SpinelCodec` class only (pyspinel `codec.py` lines 74–417: `parse_*`, `parse_field(s)`, `encode_*`, `encode_fields`, `encode_packet`), imports reduced to `struct`. `const.py`: the `SPINEL` class only. Record the modifications in the vendored header. As built, `codec.py` also fixes pyspinel defects the host needs, all listed in its header: `encode_X` added, `'c'` encoded signed, `encode_i(0)` gives one byte, `encode_U` gives UTF-8 bytes, `parse_field('i')` returns the value only, `encode_fields`/`next_code` are classmethods, unknown codes and extra fields raise `ValueError`. `const.py` gains the `STATUS_*` constants of `spinel.h` (pyspinel has only the status strings).
+- ruff (as built): `extend-select` I/UP/B; the vendored `codec.py`/`const.py` are excluded from formatting and exempt from some lint rules. `tests/conftest.py` adds `--transport` and skips `hw`/`simdev` tests without it or without `OPENER_SIMDEV_EXE`.
 - `hdlc.py` (ours, FCS table logic from pyspinel `hdlc.py`): `def hdlc_encode(frame: bytes) -> bytes`; `class HdlcDecoder: def __init__(self, max_frame: int = 1300); def feed(self, data: bytes) -> list[bytes]; errors: int`. Same rules as Task 4.
-- `dectnrp_constants.py`: the same names as the C header, minus the `DECTNRP_SPINEL_` prefix (`PROP_DRV_ENABLED = 0x3D00`, …, `FMT_OP_PREFIX = "SCSCX"`, …, `class OpType(IntEnum)`, `class EventCode(IntEnum)`).
+- `dectnrp_constants.py`: the same names as the C header, minus the `DECTNRP_SPINEL_` prefix (`PROP_DRV_ENABLED = 0x3D00`, …, `FMT_OP_PREFIX = "SCSCX"`, …, `class OpType(IntEnum)`, `class EventCode(IntEnum)`; `class Reception(IntEnum)` was added in Task 13).
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `test_codec.py`: `encode_fields("SCSCX", 0x1234, 1, 1677, 1, 0x0102030405060708).hex() == "341201 8d0601 0807060504030201".replace(" ","")`. Parsing returns the tuple. `encode_fields("i", 0x3D00)` round-trips as a packed uint (`b"\x80\x7a"`).
   - `test_hdlc.py`: the same cases as Task 4 (FCS of `b"123456789"` = 0x906E, escapes, roundtrip of 0..255, bad FCS skipped with `errors == 1`, garbage then frame, overflow resync, data split across `feed` calls one byte at a time).
-  - `test_constants.py`: parse `../opener-samples/deps/dectnrp-opener/include/zephyr/net/dectnrp_spinel.h` (path from env `OPENER_DIR`, default `../opener-samples/deps/dectnrp-opener`; `pytest.skip` if absent) with a regex over `DECTNRP_SPINEL_(\w+)\s*=\s*(0x[0-9A-Fa-f]+|\d+)` and `#define DECTNRP_SPINEL_FMT_(\w+)\s+"(\w*)"`. Assert every C name exists in Python with the same value.
-- [ ] **Step 2: Run, expect FAIL**: `../.venv/bin/pytest tests/spinel -v`
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run, expect PASS**, plus `ruff check && ruff format --check`.
-- [ ] **Step 5: Commit** `feat: add package skeleton and Spinel codec`.
+  - `test_constants.py`: parse `../opener-samples/deps/dectnrp-opener/include/zephyr/net/dectnrp_spinel.h` (path from env `OPENER_DIR`, default `../opener-samples/deps/dectnrp-opener`; `pytest.skip` if absent) with a regex over `DECTNRP_SPINEL_(\w+)\s*=\s*(0x[0-9A-Fa-f]+|\d+)` and `#define DECTNRP_SPINEL_FMT_(\w+)\s+"(\w*)"`. Assert every C name exists in Python with the same value. As built, it also matches numeric and `BIT(n)` defines (`CAP_*`, `STATUS_ERRNO_BASE`, `INTERFACE_TYPE`, `OP_FLAG_*`, `RX_VALID_*`).
+  - As built, the tests are: `test_codec.py` `test_encode_op_prefix`, `test_parse_op_prefix`, `test_packed_uint_roundtrip`, `test_packed_uint_zero`, `test_signed_byte_roundtrip`, `test_data_with_length_then_data`, `test_utf8_roundtrip`, `test_too_many_fields`, `test_unknown_format`, `test_encode_packet`; `test_hdlc.py` the Task 4 names plus `test_encode_escapes_all_special_bytes`, `test_max_frame_accepted`, `test_split_feed_one_byte_at_a_time`, `test_frame_without_leading_flag`; `test_constants.py` `test_numbers_match`, `test_formats_match`, `test_enums_match_constants`.
+- [x] **Step 2: Run, expect FAIL**: `../.venv/bin/pytest tests/spinel -v`
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run, expect PASS**, plus `ruff check && ruff format --check`.
+- [x] **Step 5: Commit** `feat: add package skeleton and Spinel codec`.
 
 ### Task 11: linux-tools — transports (uart, tcp) and URL factory
 
@@ -440,23 +468,25 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
 
 **Interfaces:**
 - `base.py`: `class TransportClosed(Exception)`; `class Transport(abc.ABC)` with `async def open(self) -> None`, `async def close(self) -> None`, `async def send(self, frame: bytes) -> None`, `async def recv(self) -> bytes` (whole Spinel frame; raises `TransportClosed`), `errors: int`, and async context manager support.
-- `uart.py`: `UartTransport(path: str, baud: int = 1_000_000)`. pyserial opened non-blocking and wrapped with `loop.add_reader(fd)`, feeding `HdlcDecoder`, so there is no thread.
+- `uart.py`: `UartTransport(path: str, baud: int = 1_000_000)`. pyserial opened non-blocking and wrapped with `loop.add_reader(fd)`, feeding `HdlcDecoder`, so there is no thread. As built: `send()` writes the non-blocking fd directly and waits with `add_writer` (no pyserial write path); a read error or EOF (unplug, pty hang-up) closes the transport and `recv()` raises `TransportClosed`. `Transport.errors` is a class attribute (0), overridden by a property in `UartTransport` (the decoder's errors); TCP has no link-level errors. Fix pass (`9d91bd1`): concurrent `send()` calls are serialized so frames cannot interleave.
 - `tcp.py`: `TcpTransport(host: str, port: int)`, frames `[len u16 LE][frame]` (§6.1).
 - `__init__.py`: `def open_transport(url: str) -> Transport`:
   - `uart:///dev/ttyACM0?baud=1000000` → `UartTransport`;
   - a bare `/dev/…` path → uart;
   - `tcp://host:port` → `TcpTransport`;
   - `spi://` → `NotImplementedError("plan 3")`;
-  - anything else → `ValueError`.
+  - anything else → `ValueError`, as are unknown uart query parameters and a non-integer baud (as built).
+  - Plan 2 Task 4 added `register_scheme(scheme, factory)`, consulted before the built-in schemes.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `test_url.py`: the parse cases above, including the default baud and `?baud=115200`.
   - `test_uart.py`: use `os.openpty()`, give the transport the slave name, and write HDLC frames raw on the master fd. `recv()` returns 2 frames split across 3 writes; `send()` bytes read on the master are `hdlc_encode(frame)`; garbage before a frame increments `errors`.
   - `test_tcp.py`: an `asyncio.start_server` echo peer; round-trip of a 1300-byte frame; a peer close makes `recv()` raise `TransportClosed`.
-- [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run, expect PASS.**
-- [ ] **Step 5: Commit** `feat: add UART and TCP transports`.
+  - As built, the tests are: `test_url.py` `test_uart_url_default_baud`, `test_uart_url_baud`, `test_bare_dev_path_is_uart`, `test_tcp_url`, `test_spi_url_not_implemented`, `test_bad_urls` (plus `test_registered_scheme` from plan 2); `test_uart.py` `test_recv_frames_split_across_writes`, `test_send_writes_hdlc_frame`, `test_garbage_before_frame_counts_error`, `test_recv_after_close_raises`, `test_peer_hang_up_raises` (plus `test_concurrent_sends_do_not_interleave` from the fix pass); `test_tcp.py` `test_round_trip_max_frame`, `test_wire_format_is_length_prefixed`, `test_peer_close_raises`. `pyproject.toml` sets `asyncio_default_fixture_loop_scope = "function"`.
+- [x] **Step 2: Run, expect FAIL.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run, expect PASS.**
+- [x] **Step 5: Commit** `feat: add UART and TCP transports`.
 
 ### Task 12: linux-tools — async Spinel client
 
@@ -466,27 +496,29 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
 
 **Interfaces:**
 - `@dataclass(frozen=True) class SpinelFrame: tid: int; cmd: int; prop: int | None; value: bytes`
-- Exceptions: `SpinelError(status: int)` (str shows the `SPINEL.STATUS_*` name, or `errno <n>` for the Opener base range), `SpinelTimeout`, `DeviceReset(status: int)`.
+- Exceptions: `SpinelError(status: int)` (str shows the `SPINEL.STATUS_*` name, or `errno <n>` for the Opener base range), `SpinelTimeout` (as built, a subclass of `TimeoutError`), `DeviceReset(status: int)`.
 - `class SpinelClient`:
-  - `__init__(self, transport: Transport, timeout: float = 1.0)`;
+  - `__init__(self, transport: Transport, timeout: float = 1.0, max_in_flight: int = MAX_IN_FLIGHT)` (as built; `max_in_flight` came with the fix pass, `MAX_IN_FLIGHT = 4` = the device's `RX_BUFS`);
   - `async def start(self) -> None` (spawns the reader task);
   - `async def close(self) -> None`;
   - `async def request(self, cmd: int, prop: int | None = None, value: bytes = b"") -> SpinelFrame`;
   - `async def get(self, prop: int) -> bytes`;
   - `async def set(self, prop: int, value: bytes) -> bytes`;
   - `async def insert(self, prop: int, value: bytes) -> bytes`;
-  - `async def reset(self) -> None` (sends `CMD_RESET` and waits for TID-0 `LAST_STATUS RESET_*`);
+  - `async def reset(self, timeout: float = RESET_TIMEOUT) -> None` (sends `CMD_RESET` and waits for TID-0 `LAST_STATUS RESET_*`). As built, `CMD_RESET` goes out on TID 0, since the device answers on TID 0 whatever the request TID, with its own `RESET_TIMEOUT = 2.0` s because the device waits up to `CONFIG_DECTNRP_SPINEL_RESET_TIMEOUT_MS` (1 s) before answering;
   - `def subscribe(self) -> asyncio.Queue[SpinelFrame]` (every TID-0 frame, including resets);
   - `def unsubscribe(self, q) -> None`;
-  - `on_reset: list[Callable[[int], None]]` (called on an unsolicited `RESET_*` not caused by `reset()`).
+  - `on_reset: list[Callable[[int], None]]` (called on an unsolicited `RESET_*` not caused by `reset()`);
+  - `on_close: list[Callable[[TransportClosed], None]]` (added in plan 2's fix pass, `4cb87d4`: called when the transport is lost).
+- As built: any `RESET_*` notification (from `reset()` or unsolicited) fails the pending requests with `DeviceReset` (spec §7); `close()` and a closed transport fail them with `TransportClosed`. The client is not re-exported from `opener_tools.spinel` (import cycle spinel → transport → spinel.hdlc). Tests import `tests/fakes.py` as `fakes`.
 - Rules:
   - TIDs cycle 1..15. A TID is not reused while a request on it is pending.
   - After a timeout the TID stays quarantined for `timeout` seconds, so a stale reply cannot satisfy a later request (Review Focus 5).
-  - When all 15 TIDs are busy, `request` waits.
+  - When all 15 TIDs are busy, `request` waits. Fix pass (`5f624b3`): it also waits while `max_in_flight` (4) requests are pending, since the device drops frames beyond its 4 RX buffers.
   - A reply whose `cmd` is `PROP_VALUE_IS` with prop `LAST_STATUS` and status ≠ OK raises `SpinelError`. A status OK reply to a `CMD_NOOP` resolves.
   - `get`/`set`/`insert` return the value. They check that the reply prop matches, else `SpinelError(PARSE_ERROR)`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `test_get_matches_tid`: a fake answers TID 1 → `get` returns the value.
   - `test_status_error`: a reply with `LAST_STATUS PROP_NOT_FOUND` raises `SpinelError`, with `.status == SPINEL.STATUS_PROP_NOT_FOUND`.
   - `test_errno_status_str`: status 0x3C80+5 → `str` contains `errno 5`.
@@ -496,10 +528,11 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
   - `test_unsolicited_fanout`: two subscribers both receive a TID-0 frame.
   - `test_reset_ok`: `reset()` resolves when the fake sends `LAST_STATUS RESET_SOFTWARE` TID 0 and does not trigger `on_reset`.
   - `test_unsolicited_reset_callback`: an injected `RESET_POWER_ON` calls `on_reset` with that status.
-- [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run, expect PASS.**
-- [ ] **Step 5: Commit** `feat: add asyncio Spinel client`.
+  - Extra tests as built: `test_noop_status_ok`, `test_prop_mismatch` (→ `PARSE_ERROR`), `test_unsubscribe`, `test_reset_fails_pending_request`, and `test_in_flight_limit` from the fix pass.
+- [x] **Step 2: Run, expect FAIL.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run, expect PASS.**
+- [x] **Step 5: Commit** `feat: add asyncio Spinel client`.
 
 ### Task 13: linux-tools — driver-level `Radio` API, events, timing
 
@@ -537,8 +570,14 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
     - `async def schedule_rssi1(self, channel: int, subslots: int, start: int | None = None) -> Op`;
     - `def events(self) -> AsyncIterator[Event]` (every event, including the ones that belong to Ops).
   - Tokens cycle 1..65535, skipping in-flight ones. **The Op is registered under its token before the insert is sent** (Review Focus 1). If the insert fails, it is unregistered and the `SpinelError` is re-raised. On a client reset (`on_reset`, or `reset()`), every pending Op fails with `DeviceReset`.
+- As built (`cf39fe2`):
+  - `Radio` routes resets from its client subscription (the same stream as the events), not through `on_reset`, so an `OP_FINISHED` sent before the reset notification resolves its Op instead of failing it; `reset()` waits until the router has seen the notification. `Radio` starts its router task in `__init__` (it needs a running loop) and gains `async def close()`.
+  - The capability constant is `nrp.CAP_DRV`. `Reception` uses the driver header names: `SINGLE_SHOT`, `SEMICONTINUOUS`, `CONTINUOUS`. `Op.done` is a property.
+  - `MsgError.pcc` is `None` when the PCC valid bit is clear or the PCC is empty. An `INSERTED` token other than the request's raises `SpinelError(PARSE_ERROR)`. Any insert failure, timeout and `DeviceReset` included, unregisters the Op.
+  - `tests/fakes.py` gains `make_frame`/`status_frame`/`event_frame` and `ScriptedDevice` (answers `CMD_RESET` with `RESET_SOFTWARE`).
+  - Plan 2's fix pass (`4cb87d4`) added: on transport loss (client `on_close`), pending Ops and `events()` streams raise `TransportClosed`.
 
-- [ ] **Step 1: Write the failing tests** (`FakeTransport`, plus a small `ScriptedDevice` helper in `tests/fakes.py` that answers GET/SET/INSERT from a dict and lets the test inject events):
+- [x] **Step 1: Write the failing tests** (`FakeTransport`, plus a small `ScriptedDevice` helper in `tests/fakes.py` that answers GET/SET/INSERT from a dict and lets the test inject events):
   - `test_events.py`: decode a `MSG_RECEIVED` built with `encode_fields` (valid=0b11 → rssi2/snr set; valid=0 → `None`); decode a `MSG_ERROR` with empty pcc → `pcc is None`; decode `OP_RESULTS` with 48 bytes.
   - `test_timing.py`: `Timing(2880)`: frame 691200, ms 69120, subslot 14400, `ms_to_ticks(20) == 1382400`.
   - `test_radio.py`:
@@ -549,10 +588,11 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
     - `test_reset_fails_pending_ops`: two ops pending, then an injected `RESET_POWER_ON`: both raise `DeviceReset`.
     - `test_rx_reception_flags`: `reception=Reception.CONTINUOUS` with `start=1000` → flags byte `0x21`.
     - `test_tx_payload`: the TX encoding matches `FMT_OP_PREFIX + FMT_OP_TX`.
-- [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run, expect PASS.**
-- [ ] **Step 5: Commit** `feat: add driver-level Radio API`.
+  - As built, `test_events.py` has `test_msg_received_valid`, `test_msg_received_not_valid`, `test_msg_error_without_pcc`, `test_msg_error_with_pcc`, `test_op_results`, `test_op_finished`, `test_unknown_code`, `test_truncated`; `test_timing.py` has `test_nrf91_timing`, `test_conversions`; `test_radio.py` adds `test_init`, `test_init_checks_caps`, `test_properties`, `test_rx_immediate`, `test_rssi1_payload`, `test_tokens_distinct`, `test_reset_command_fails_pending_ops`, `test_finished_before_reset_resolves`, `test_events_stream`, and `test_transport_closed_fails_ops` (plan 2 fix pass).
+- [x] **Step 2: Run, expect FAIL.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run, expect PASS.**
+- [x] **Step 5: Commit** `feat: add driver-level Radio API`.
 
 ### Task 14: Host ↔ simulated device integration
 
@@ -560,35 +600,59 @@ While this task is in progress, `deps/dectnrp-opener` is checked out on `driver-
 - Create: `tools:tests/integration/{conftest.py,test_simdev.py}`
 
 **Interfaces:**
-- Fixture `simdev_url`. It starts `$OPENER_SIMDEV_EXE` (skip if unset). The path comes from Task 8, e.g. `../opener-samples/build/simdev/zephyr/zephyr.exe`. The fixture parses uart1's pty from stdout, using the line format recorded in Task 8 step 3, yields `uart:///dev/pts/N`, and kills the process on teardown. Tests are marked `simdev`.
+- Fixture `simdev_url`. It starts `$OPENER_SIMDEV_EXE` (skip if unset). The path comes from Task 8: `../opener-samples/build/simdev/simdev/zephyr/zephyr.exe`. The fixture parses uart1's pty from stdout, using the line format recorded in Task 8 step 3, yields `uart:///dev/pts/N`, and kills the process on teardown. Tests are marked `simdev`. As built: `simdev_url` is session-scoped and logs stdout to a file (an undrained pipe would block the device). A `radio` fixture opens a fresh transport and client per test and syncs with `reset()` + `init()` + `enable()`, since the device may still run a previous test's ops and the boot `LAST_STATUS` is lost.
 
-- [ ] **Step 1: Write the tests:**
+- [x] **Step 1: Write the tests:**
   - `test_identity`: `Radio.init()` → `caps.ticks_per_symbol == 2880`, `op_slots == 8`, `sched_op_transition == 25920`.
-  - `test_reset_enable_time`: `reset`, `enable(True)`, then two `time()` calls 100 ms apart differ by 6 912 000 ± 10 %.
-  - `test_rx_window_receives`: an immediate RX window of 500 ms → at least one `MsgReceived` with `pdc == b"Hello World!"`, then `OpFinished`.
+  - `test_reset_enable_time`: `reset`, `enable(True)`, then two `time()` calls 100 ms apart differ by 6 912 000 ± 10 %. As built: the device interval is compared with the host interval between the two requests, ± 10 ms, because each request takes about 20 ms round trip over the pty and the bare 100 ms check failed at 120 ms.
+  - `test_rx_window_receives`: an immediate RX window of 500 ms → at least one `MsgReceived` with `pdc == b"Hello World!"`, then `OpFinished`. As built, the window is continuous: a single-shot window closes on its first frame, which is the `MSG_ERROR` one time in 10.
   - `test_semicontinuous_window`: one immediate semi-continuous RX of 1 s → at least 5 `MsgReceived` before the single `OpFinished`.
   - `test_pipelined_windows`: 3 scheduled 50 ms windows from `time() + 20 ms`, each starting `caps.sched_op_transition` after the previous one ends, → 3 `OpFinished` in token order.
   - `test_stats_count`: after the above, `stats().ops_accepted >= 3`.
-- [ ] **Step 2: Build the simdev (Task 8 step 1) and run**: `OPENER_SIMDEV_EXE=… ../.venv/bin/pytest -m simdev -v`. Expect PASS. A failure here is debugged with superpowers:systematic-debugging before any fix.
-- [ ] **Step 3: Commit** `test: add simulated device integration tests`.
+- [x] **Step 2: Build the simdev (Task 8 step 1) and run**: `OPENER_SIMDEV_EXE=… ../.venv/bin/pytest -m simdev -v`. Expect PASS. A failure here is debugged with superpowers:systematic-debugging before any fix.
+- [x] **Step 3: Commit** `test: add simulated device integration tests`.
 
 ### Task 15: EK hardware smoke test (§8.3.2, first half)
 
 **Files:**
 - Create: `tools:tests/hw/{conftest.py,test_smoke.py}` (marker `hw`; the `--transport URL` option goes in `tests/conftest.py`; skip when the option is absent)
 
-- [ ] **Step 1: Write the tests**, reusing the bodies of Task 14's `test_identity`, `test_reset_enable_time`, `test_rx_window_receives` and `test_pipelined_windows` through a shared helper module `tests/integration/scenarios.py` (move them there), parametrised on the URL. The RX test asserts only `OpFinished`, not reception, since a peer is optional. Add `test_rx_from_peer`, skipped unless `--peer` is given: a 5 s immediate RX window receives a frame from a `dectnrp-driver` DK with `phy_type == 1` (type 2 header) and `b"Hello World!" in pdc`. The PDC begins with the MAC header.
-- [ ] **Step 2: Flash Device1**: `west flash -d build/nrf9131ek/nrf9131/ns/dectnrp-spinel --dev-id 1051069216`.
-- [ ] **Step 3: Run**: `../.venv/bin/pytest -m hw --transport uart:///dev/ttyACM<n> -v`, then again with `--peer` while Device2 runs `dectnrp-driver`. Expect PASS. Record which of ttyACM2/3 carries uart0.
-- [ ] **Step 4: Commit** `test: add hardware smoke tests`, then update `CLAUDE.md` (root, not a repo) with the twister, simdev and pytest commands.
+- [x] **Step 1: Write the tests**, reusing the bodies of Task 14's `test_identity`, `test_reset_enable_time`, `test_rx_window_receives` and `test_pipelined_windows` through a shared helper module `tests/integration/scenarios.py` (move them there), parametrised on the URL. The RX test asserts only `OpFinished`, not reception, since a peer is optional. Add `test_rx_from_peer`, skipped unless `--peer` is given: a 5 s immediate RX window receives a frame from a `dectnrp-driver` DK with `phy_type == 1` (type 2 header) and `b"Hello World!" in pdc`. The PDC begins with the MAC header.
+  
+  As built: `scenarios.py` has `open_radio()`, `identity()`, `reset_enable_time()`, `rx_window()`, `pipelined_windows()`; tests import it as `integration.scenarios`. `identity` asserts only `ticks_per_symbol == 2880` and `op_slots == 8`: the simdev test keeps `sched_op_transition == 25920`, the hw test asserts `> 0` (it comes from the modem). `tests/hw/test_smoke.py` has `test_identity`, `test_reset_enable_time`, `test_rx_window` (continuous 500 ms), `test_pipelined_windows`, `test_rx_from_peer`; the `--peer` option is in `tests/conftest.py`, the `radio` fixture in `tests/hw/conftest.py`. `test_rx_from_peer` opens repeated single-shot windows within the 5 s budget until a type 2 `"Hello World!"` frame arrives: nRF91x1 continuous RX never receives `dectnrp-driver`'s type 2 format 0 unicast, semi-continuous ends on it, and a single shot can end on a failed frame or on another transmitter. Fix pass (`f3f35f9`): it first sets the peer network ID `0x32545279`.
+- [x] **Step 2: Flash Device1**: `west flash -d build/nrf9131ek/nrf9131/ns/dectnrp-spinel --dev-id 1051069216`.
+- [x] **Step 3: Run**: `../.venv/bin/pytest -m hw --transport uart:///dev/ttyACM<n> -v`, then again with `--peer` while Device2 runs `dectnrp-driver`. Expect PASS. Record which of ttyACM2/3 carries uart0. Result: ttyACM2 is uart0 (ttyACM3 silent); `--transport 'uart:///dev/ttyACM2?baud=1000000'` → 4 passed, 1 skipped (×3); with `--peer` → 5 passed (×3). `test_reset_enable_time` found an nRF91x1 driver bug: `stop()` called `nrf_modem_dect_phy_deinit()` while `start()` only re-activates, so after any stop/start every time event failed and `get_time()` returned a stale value. Fixed in opener `c06f7fe`: `stop()` deactivates, `get_time()` returns `-EIO` on a failed time event.
+- [x] **Step 4: Commit** `test: add hardware smoke tests`, then update `CLAUDE.md` (root, not a repo) with the twister, simdev and pytest commands.
 
 ### Task 16: CI (§8.4)
 
 The opener repo is not a west workspace and has no workflow able to run twister. The Spinel ztests therefore run in opener-samples' CI, which already checks out opener through west. This is the user's decision, and they will discuss it with the community.
 
 **Files:**
-- Modify: `samples:.github/workflows/build-samples.yml`. Add a build step for `samples/dectnrp-spinel/` to `${BUILD_BASE}/dectnrp-spinel`, staging and upload like `dectnrp-driver`, plus a new job `spinel-tests` with the same setup steps that runs `west twister -T deps/dectnrp-opener/tests -p native_sim/native/64 --inline-logs`.
+- Modify: `samples:.github/workflows/build-samples.yml`. Add a build step for `samples/dectnrp-spinel/` to `${BUILD_BASE}/dectnrp-spinel`, staging and upload like `dectnrp-driver` (as built, staged from `${BUILD_BASE}/dectnrp-spinel/dectnrp-spinel/zephyr`, the sysbuild app subfolder), plus a new job `spinel-tests` with the same setup steps that runs `west twister -T deps/dectnrp-opener/tests -p native_sim/native/64 --inline-logs`.
 - Create: `tools:.github/workflows/ci.yml`: Python 3.11 and 3.14 matrix, `pip install -e '.[dev]'`, `ruff check`, `ruff format --check`, `pytest` (the simdev and hw markers skip themselves).
 
-- [ ] **Step 1: Validate the workflows locally.** Run `actionlint` on both files if installed. Otherwise run each `run:` command by hand: the twister command from `opener-samples/`, and the pytest/ruff commands from `linux-tools/` in a fresh venv. Expect PASS.
-- [ ] **Step 2: Commit** in opener-samples `ci: build dectnrp-spinel and run Spinel ztests`, and in linux-tools `ci: add pytest and ruff workflow`.
+- [x] **Step 1: Validate the workflows locally.** Run `actionlint` on both files if installed. Otherwise run each `run:` command by hand: the twister command from `opener-samples/`, and the pytest/ruff commands from `linux-tools/` in a fresh venv. Expect PASS. Result: `actionlint` not installed, YAML parsed; twister → 5 suites passed + simdev built, 42/42 cases; the `dectnrp-spinel` staged files exist; fresh Python 3.14 venv: ruff clean, pytest 83 passed, 11 skipped. Python 3.11 was not available locally, so that matrix entry is unverified.
+- [x] **Step 2: Commit** in opener-samples `ci: build dectnrp-spinel and run Spinel ztests`, and in linux-tools `ci: add pytest and ruff workflow`.
+
+## After the plan
+
+Final review (Opus, fresh context, on the three repos' diffs): verdict "with fixes", 0 critical, 6 important, 17 minor. All 6 important findings were fixed (committed 2026-10-29):
+
+- linux-tools `9d91bd1`: UART `send()` serialized; concurrent frames no longer interleave (`test_concurrent_sends_do_not_interleave`).
+- linux-tools `5f624b3`: the client keeps at most `MAX_IN_FLIGHT = 4` requests pending, the device's RX buffers (`test_in_flight_limit`).
+- opener `2d95688`: TX data larger than one `net_buf` is rejected with `INVALID_ARGUMENT` instead of being truncated by the driver (`test_insert_tx_larger_than_net_buf`). Chosen over a `BUILD_ASSERT`, which would break the ztest builds on the default 128-byte `net_buf`.
+- opener `870003f`: `CMD_RESET` clears the short NWID/RXADDR filters (`test_reset_clears_filters`). The network ID is kept: every host flow sets it and there is no neutral default.
+- opener `9ab85e8`: nRF91x1 `start()` configures the PHY before each activation (nrfxlib contract) and checks the activate/deactivate status. No failing test was possible (the current modem firmware tolerates it); checked on the bench with `pytest -m hw --peer` → 5 passed ×3.
+- opener-samples `c527c00`: `west.yml` fetches the codium forks over HTTPS (the CI runner has no SSH key).
+- linux-tools `f3f35f9`: `test_rx_from_peer` sets the `dectnrp-driver` network ID. It had passed in Task 15 only because an earlier session left that ID on the device.
+
+After the fix pass: `pytest -q` → 85 passed, 11 skipped; twister → 44/44.
+
+Open, deferred minor findings:
+
+- Device: `spinel_ops` reset force-frees slots of ops that did not finish in time while the driver may still hold `&slots[i].op`; the `slot_released` semaphore is not reset before the wait loop; the comment "Only the RX thread changes the generation" is wrong; `FINISHED_FRAME_SIZE` (16) has no `BUILD_ASSERT`.
+- Device: `DECTNRP_SPINEL_TRANSPORT_SPI` is selectable with no implementation (link error); `subsys/spinel/lib/README.rst` claims per-file warning silencing that does not exist; an nRF91x1-specific `@note` sits in the generic `dectnrp_driver.h` reception enum; spec §5.1 says the iface lookup is Kconfig-overridable, the code takes the first DECTNRP iface.
+- Driver: `c06f7fe` and `9ab85e8` are not on `driver-rx-mode` with the other driver commits; nRF91x1 `start`/`stop` error paths and `HDR_STATUS_VALID_RX_END` handling were not judged (pre-existing code). If a driver ever emitted an event synchronously inside `schedule()`, it would reach the host before `INSERTED` (the nRF91 driver reports asynchronously).
+- Host: the client does not quarantine TIDs failed with `DeviceReset`; codec `parse_d` returns truncated bytes when the length prefix exceeds the data; `Radio._schedule` leaves a dead Op in `_ops` when cancelled; event/subscriber queues grow without bound when an `events()` iterator is abandoned; `timing.py` assumes mu = 1 without saying so.
+- CI and files: the linux-tools CI never runs `test_constants` (no opener checkout); the sample `boards/*.dtsi` lack SPDX headers and the partition dtsi lacks a final newline.
