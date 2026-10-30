@@ -55,9 +55,18 @@ def _tlv(tlv_type: int, value: int, size: int) -> bytes:
     return _TLV.pack(tlv_type, size) + value_bytes + padding
 
 
-def _metric(value: int) -> int:
-    # Raw driver value as 16 bits: a negative SNR is sign-extended.
-    return value & 0xFFFF
+def _tap_rssi2(code: int) -> int:
+    """Driver RSSI-2 code, the low byte of the signed dBm value (ETSI TS
+    103 636-2 V2.2.1 Table 8.3.3-1), to the TAP int16 in 0.5 dBm (Q14.1)."""
+    # §8.3.3: the dBm value is 0xFF00 | code, always negative.
+    dbm = code - 0x100
+    return (dbm * 2) & 0xFFFF
+
+
+def _tap_snr(snr: int) -> int:
+    """Driver SNR in 0.5 dB (ETSI TS 103 636-2 V2.2.1 Table 8.4.3-1) to the
+    TAP int16 in 0.25 dB (Q13.2)."""
+    return (snr * 2) & 0xFFFF
 
 
 def build_tap_record(ev: MsgReceived | MsgError, modem_time: bool = False) -> bytes:
@@ -92,9 +101,9 @@ def build_tap_record(ev: MsgReceived | MsgError, modem_time: bool = False) -> by
         _tlv(TLV_CHANNEL, ev.channel, 2),
     ]
     if ev.rssi2 is not None:
-        tlvs.append(_tlv(rssi2_type, _metric(ev.rssi2), 2))
+        tlvs.append(_tlv(rssi2_type, _tap_rssi2(ev.rssi2), 2))
     if ev.snr is not None:
-        tlvs.append(_tlv(snr_type, _metric(ev.snr), 2))
+        tlvs.append(_tlv(snr_type, _tap_snr(ev.snr), 2))
     if modem_time:
         time_lo = ev.start_time & 0xFFFFFFFF
         time_hi = (ev.start_time >> 32) & 0xFFFFFFFF

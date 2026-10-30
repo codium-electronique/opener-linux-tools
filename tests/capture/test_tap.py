@@ -32,7 +32,9 @@ def frame(**fields):
         dropped=0,
         phy_type=0,
         start_time=START,
-        rssi2=0x50,
+        # Driver codes, ETSI TS 103 636-2 V2.2.1 Table 8.3.3-1 and 8.4.3:
+        # -35 dBm, -1.5 dB.
+        rssi2=0xDD,
         snr=-3,
         channel=1677,
         pcc=PCC,
@@ -76,8 +78,8 @@ def test_record_layout():
         TLV_HEADER_STATUS: 0,
         TLV_TRANSACTION_ID: 7,
         TLV_CHANNEL: 1677,
-        TLV_PDC_RSSI2: 0x50,
-        TLV_PDC_SNR: 0xFFFD,
+        TLV_PDC_RSSI2: 0xFFBA,
+        TLV_PDC_SNR: 0xFFFA,
         TLV_MODEM_TIME_LO: 0x02030405,
         TLV_MODEM_TIME_HI: 0x1,
     }
@@ -130,11 +132,23 @@ def test_pdc_crc_error():
     assert tlvs["body"] == pcc
 
 
-def test_msg_error_metrics_are_pcc():
-    tlvs = parse_tap_record(build_tap_record(error(rssi2=0x40, snr=12)))
+def test_metrics_in_tap_units():
+    # -1 dBm and -140 dBm, the ends of the RSSI-2 range; 63.5 dB.
+    high = parse_tap_record(build_tap_record(frame(rssi2=0xFF, snr=127)))
+    low = parse_tap_record(build_tap_record(frame(rssi2=0x74, snr=-32)))
 
-    assert tlvs[3] == 0x40
-    assert tlvs[4] == 12
+    # TAP: RSSI2 in 0.5 dBm (Q14.1), SNR in 0.25 dB (Q13.2), int16.
+    assert high[TLV_PDC_RSSI2] == 0xFFFE
+    assert high[TLV_PDC_SNR] == 254
+    assert low[TLV_PDC_RSSI2] == 0xFEE8
+    assert low[TLV_PDC_SNR] == 0xFFC0
+
+
+def test_msg_error_metrics_are_pcc():
+    tlvs = parse_tap_record(build_tap_record(error(rssi2=0xC0, snr=12)))
+
+    assert tlvs[3] == 0xFF80
+    assert tlvs[4] == 24
     assert TLV_PDC_RSSI2 not in tlvs
     assert TLV_PDC_SNR not in tlvs
 

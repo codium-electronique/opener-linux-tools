@@ -19,7 +19,8 @@ int main(void)
 		.channel = 1677,
 		.seq = 7,
 		.has_metrics = true,
-		.metrics = {.pdc_rssi2 = 0x50, .pdc_snr = -3},
+		/* -35 dBm in Q14.1, -1.5 dB in Q13.2. */
+		.metrics = {.pdc_rssi2 = -70, .pdc_snr = -6},
 	};
 	uint8_t record[SNIFF_TAP_MAX_RECORD(sizeof(body))];
 	size_t len = sniff_build_tap_record(record, sizeof(record), &info, body);
