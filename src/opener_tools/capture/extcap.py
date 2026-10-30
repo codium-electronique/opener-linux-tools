@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Codium Electronique
+# Derived from Deveritec dectnrp-sniffer (Apache-2.0), opener-samples deveritec/dectnrp-sniffer:samples/dectnrp-sniffer/
 
 """Wireshark extcap interface of nrp-sniffer.
 
