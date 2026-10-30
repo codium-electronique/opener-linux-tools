@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Codium Electronique
 
-"""nrp-sniffer: capture DECT NR+ frames into a DECT-NR-TAP pcap."""
+"""nrp-sniffer: capture DECT NR+ frames into a DECT-NR-TAP pcap, from the
+command line or as a Wireshark extcap."""
 
 import argparse
 import asyncio
@@ -12,9 +13,10 @@ import signal
 import stat
 import sys
 from dataclasses import dataclass
+from importlib.metadata import version
 from typing import BinaryIO
 
-from opener_tools.capture import PcapWriter, build_tap_record
+from opener_tools.capture import PcapWriter, build_tap_record, extcap
 from opener_tools.dectnrp import Gap, MsgError, Radio, RxPipeline
 from opener_tools.spinel.client import DeviceReset, SpinelClient
 from opener_tools.spinel.dectnrp_constants import Reception
@@ -37,6 +39,7 @@ RX_MODES = {
     "continuous": Reception.CONTINUOUS,
 }
 RX_MODE_NAMES = {mode: name for name, mode in RX_MODES.items()}
+RX_MODE_DISPLAY = {"single": "single-shot", "semi": "semicontinuous", "continuous": "continuous"}
 
 
 @dataclass
@@ -208,15 +211,21 @@ def _int_any_base(text: str) -> int:
     return int(text, 0)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(extcap_mode: bool = False) -> argparse.ArgumentParser:
+    """The command-line parser; in extcap mode it takes the Wireshark
+    arguments too, and --transport is optional."""
     parser = argparse.ArgumentParser(
         prog="nrp-sniffer",
         description="Capture DECT NR+ frames with an Opener Spinel device into a pcap "
         "(link type DECT_NR_TAP, 304).",
     )
+    transport_default = None
+    if extcap_mode:
+        transport_default = extcap.DEFAULT_TRANSPORT
     parser.add_argument(
         "--transport",
-        required=True,
+        required=not extcap_mode,
+        default=transport_default,
         metavar="URL",
         help="device link: uart:///dev/ttyACM0?baud=1000000 or tcp://host:port",
     )
@@ -261,6 +270,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="pcap output, - for stdout (default)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logs")
+    if extcap_mode:
+        extcap.add_arguments(parser)
     return parser
 
 
@@ -312,9 +323,45 @@ def _format_stats(stats: SnifferStats) -> str:
     )
 
 
+def _extcap_answer(args: argparse.Namespace) -> str | None:
+    """Return the answer to a Wireshark query, None for a capture."""
+    if args.extcap_dlts:
+        return extcap.dlts()
+    if args.extcap_config:
+        rx_mode = RX_MODE_NAMES[DEFAULT_RX_MODE]
+        return extcap.config(
+            DEFAULT_CHANNEL,
+            DEFAULT_NETWORK_ID,
+            RX_MODE_DISPLAY,
+            rx_mode,
+            DEFAULT_WINDOW_MS,
+            DEFAULT_DEPTH,
+        )
+    if args.capture:
+        return None
+    # --extcap-interfaces, or --extcap-version alone.
+    package_version = version("opener-tools")
+    return extcap.interfaces(package_version)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
+    extcap_mode = extcap.wants_extcap(argv)
+    parser = build_parser(extcap_mode)
+    if extcap_mode:
+        # Wireshark versions add arguments over time: ignore the unknown ones.
+        args, _ = parser.parse_known_args(argv)
+        answer = _extcap_answer(args)
+        if answer is not None:
+            sys.stdout.write(answer)
+            return 0
+        if args.fifo is None:
+            parser.error("--capture needs --fifo")
+        output = args.fifo
+    else:
+        args = parser.parse_args(argv)
+        output = args.write
     level = logging.INFO
     if args.verbose:
         level = logging.DEBUG
@@ -323,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     log = logging.getLogger("nrp-sniffer")
 
-    out, flush_each = _open_output(args.write)
+    out, flush_each = _open_output(output)
     try:
         stats = asyncio.run(_run_until_signal(args, out, flush_each, log))
     except Exception as exc:
