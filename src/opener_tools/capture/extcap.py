@@ -86,5 +86,8 @@ def config(
         "arg {number=5}{call=--depth}{display=Queued windows}{type=unsigned}"
         f"{{default={depth}}}"
         "{tooltip=RX windows queued on the device}",
+        "arg {number=6}{call=--modem-time-tlv}{display=Modem time TLVs}{type=boolflag}"
+        "{default=false}"
+        "{tooltip=Add the frame start modem time to each record; Wireshark shows it as unknown TLVs}",
     ]
     return "\n".join(lines) + "\n"

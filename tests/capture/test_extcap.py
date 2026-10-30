@@ -87,6 +87,7 @@ def test_config_lists_args(capsys):
         "call=--rx-mode",
         "call=--window",
         "call=--depth",
+        "call=--modem-time-tlv",
     ]
     assert "{type=string}" in args[0]
     assert "{default=uart:///dev/ttyACM0}" in args[0]
@@ -99,6 +100,7 @@ def test_config_lists_args(capsys):
     assert "{default=20}" in args[4]
     assert "{type=unsigned}" in args[5]
     assert "{default=4}" in args[5]
+    assert "{type=boolflag}" in args[6]
     values = [line for line in lines if line.startswith("value {arg=3}")]
     assert values == [
         "value {arg=3}{value=single}{display=single-shot}{default=true}",
@@ -107,7 +109,7 @@ def test_config_lists_args(capsys):
     ]
 
 
-def test_capture_to_fifo(device, tmp_path):
+def test_capture_to_fifo(device, tmp_path, capsys):
     path = tmp_path / "fifo"
     os.mkfifo(path)
     device.script = [received]
@@ -135,6 +137,10 @@ def test_capture_to_fifo(device, tmp_path):
     header, records = read_pcap(reader.data)
     assert header[6] == 304
     assert len(records) >= 1
+    # Wireshark reports anything on stderr as an error.
+    assert capsys.readouterr().err == ""
+    log = logging.getLogger("nrp-sniffer")
+    assert log.getEffectiveLevel() == logging.WARNING
 
 
 def test_extcap_fifo_closed(device, tmp_path, caplog):
@@ -145,8 +151,11 @@ def test_extcap_fifo_closed(device, tmp_path, caplog):
     device.when_written(20, DEPTH, interrupt)
     reader = FifoReader(path, PCAP_HEADER_LEN)
 
+    # -v: extcap mode logs only warnings otherwise.
     with caplog.at_level(logging.INFO):
-        code = main(["--capture", "--fifo", str(path), "--transport", "fake://", "--window", "5"])
+        code = main(
+            ["--capture", "--fifo", str(path), "--transport", "fake://", "--window", "5", "-v"]
+        )
 
     reader.join()
     assert code == 0

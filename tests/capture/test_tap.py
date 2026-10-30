@@ -65,7 +65,7 @@ def tlv_types(record):
 
 
 def test_record_layout():
-    record = build_tap_record(frame())
+    record = build_tap_record(frame(), modem_time=True)
     types = tlv_types(record)
 
     assert record[:8] == bytes([1, 0, 8 * len(types), 0, 17, 0, 0, 0])
@@ -81,19 +81,36 @@ def test_record_layout():
         TLV_MODEM_TIME_LO: 0x02030405,
         TLV_MODEM_TIME_HI: 0x1,
     }
-    assert types.index(TLV_MODEM_TIME_LO) < types.index(TLV_MODEM_TIME_HI)
     assert body == PCC + PDC
     assert record[-17:] == PCC + PDC
     assert len(record) == 8 + 8 * len(types) + 17
 
 
-def test_min_tlv_count():
+def test_no_modem_time_by_default():
+    record = build_tap_record(frame())
+    types = tlv_types(record)
+
+    # The DECT-NR-TAP format defines types 1 to 9 only.
+    assert TLV_MODEM_TIME_LO not in types
+    assert TLV_MODEM_TIME_HI not in types
+    assert TLV_PAD not in types
+    assert len(record) == 8 + 6 * 8 + 17
+
+
+def test_min_record_length():
     record = build_tap_record(frame(rssi2=None, snr=None))
     types = tlv_types(record)
 
-    assert len(types) == 8
-    assert types[6:] == [TLV_PAD, TLV_PAD]
-    assert len(record) == 8 + 8 * 8 + 17
+    # Padded only up to the 72 bytes the reference dissector requires.
+    assert types[4:] == [TLV_PAD, TLV_PAD]
+    assert len(record) == 8 + 6 * 8 + 17
+
+
+def test_no_padding_with_modem_time():
+    record = build_tap_record(frame(rssi2=None, snr=None), modem_time=True)
+    types = tlv_types(record)
+
+    assert TLV_PAD not in types
 
 
 def test_empty_pdc():

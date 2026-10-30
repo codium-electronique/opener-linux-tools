@@ -65,6 +65,7 @@ class _Sniffer:
         lead_ms: float,
         stop: asyncio.Event,
         log: logging.Logger,
+        modem_time: bool,
     ):
         self.radio = radio
         self.writer = writer
@@ -76,6 +77,7 @@ class _Sniffer:
         self.lead_ms = lead_ms
         self.stop = stop
         self.log = log
+        self.modem_time = modem_time
         self.stats = SnifferStats()
 
     async def run(self) -> None:
@@ -135,7 +137,7 @@ class _Sniffer:
                     self.stats.gaps += 1
                     self.stats.gap_ms += gap_ms
                     continue
-                record = build_tap_record(item)
+                record = build_tap_record(item, self.modem_time)
                 self.writer.write(record)
                 self.stats.records += 1
                 if isinstance(item, MsgError):
@@ -162,9 +164,11 @@ async def run_sniffer(
     stop: asyncio.Event,
     log: logging.Logger,
     flush_each: bool = False,
+    modem_time: bool = False,
 ) -> SnifferStats:
     """Write the frames received on channel to out as a DECT-NR-TAP pcap,
-    until stop is set or the reader of out goes away.
+    until stop is set or the reader of out goes away; with modem_time, the
+    records carry the frame start times in modem time ticks.
 
     A device reset is logged and the device initialised again; the capture
     goes on in the same file. Before returning, the queued windows finish
@@ -188,6 +192,7 @@ async def run_sniffer(
                 lead_ms,
                 stop,
                 log,
+                modem_time,
             )
             try:
                 await sniffer.run()
@@ -269,6 +274,11 @@ def build_parser(extcap_mode: bool = False) -> argparse.ArgumentParser:
         metavar="FILE",
         help="pcap output, - for stdout (default)",
     )
+    parser.add_argument(
+        "--modem-time-tlv",
+        action="store_true",
+        help="add the frame start modem time to each record, as TLVs Wireshark shows as unknown",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logs")
     if extcap_mode:
         extcap.add_arguments(parser)
@@ -309,6 +319,7 @@ async def _run_until_signal(
             stop,
             log,
             flush_each=flush_each,
+            modem_time=args.modem_time_tlv,
         )
     finally:
         for signum in signals:
@@ -363,12 +374,16 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
         output = args.write
     level = logging.INFO
+    if extcap_mode:
+        # Wireshark reports anything on stderr as an error.
+        level = logging.WARNING
     if args.verbose:
         level = logging.DEBUG
     logging.basicConfig(
         stream=sys.stderr, level=level, format="%(asctime)s %(levelname)s %(message)s"
     )
     log = logging.getLogger("nrp-sniffer")
+    log.setLevel(level)
 
     out, flush_each = _open_output(output)
     try:
@@ -377,5 +392,8 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", exc, exc_info=args.verbose)
         return 1
     summary = _format_stats(stats)
-    print(summary, file=sys.stderr)
+    if extcap_mode:
+        log.info("%s", summary)
+    else:
+        print(summary, file=sys.stderr)
     return 0

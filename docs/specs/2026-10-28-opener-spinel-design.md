@@ -241,7 +241,7 @@ Vendored pyspinel subset: codec (`encode_fields` / `parse_fields`, packed uint),
 
 ### 6.4 Capture (`capture/`)
 
-DECT NR TAP record builder and libpcap writer (link type 304), derived from the Deveritec sniffer host code (Apache-2.0, attribution kept). TLVs: data type, header status (PDC CRC error → status from `MSG_ERROR`), PCC/PDC RSSI2 and SNR when valid, real channel (from the event), transaction ID (token), modem time (start_time hi/lo), padding to the reference dissector's minimum length. pcap timestamps are host time; modem time is carried in the TAP TLVs. Wireshark extcap entry point shares the same writer.
+DECT NR TAP record builder and libpcap writer (link type 304), derived from the Deveritec sniffer host code (Apache-2.0, attribution kept). TLVs: data type, header status (PDC CRC error → status from `MSG_ERROR`), PCC/PDC RSSI2 and SNR when valid, real channel (from the event), transaction ID (token), padding to the reference dissector's minimum record length. pcap timestamps are host time. The DECT-NR-TAP format defines TLV types 1–9 only; on request (`--modem-time-tlv`) the records also carry the frame start in modem time as TLVs 10 (hi) and 11 (lo), an Opener addition that Wireshark shows as unknown TLVs. Wireshark extcap entry point shares the same writer.
 
 ### 6.5 Tools
 

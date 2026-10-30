@@ -11,7 +11,12 @@ import pytest
 from fakes import event_frame
 from pcapfile import read_pcap
 
-from opener_tools.capture.tap import TLV_DATA_TYPE, parse_tap_record
+from opener_tools.capture.tap import (
+    TLV_DATA_TYPE,
+    TLV_MODEM_TIME_HI,
+    TLV_MODEM_TIME_LO,
+    parse_tap_record,
+)
 from opener_tools.cli.sniffer import main, run_sniffer
 from opener_tools.spinel import SPINEL, SpinelCodec
 from opener_tools.spinel import dectnrp_constants as nrp
@@ -242,3 +247,18 @@ def test_rx_mode_option(device, tmp_path):
     _, flags, _, _ = device.ops[0]
     reception = (flags & nrp.OP_FLAG_RX_RECEPTION_MASK) >> nrp.OP_FLAG_RX_RECEPTION_SHIFT
     assert reception == Reception.CONTINUOUS
+
+
+@pytest.mark.parametrize("args, expected", [(["--modem-time-tlv"], True), ([], False)])
+def test_modem_time_option(device, tmp_path, args, expected):
+    device.script = [received]
+    device.when_written(1, DEPTH, lambda: os.kill(os.getpid(), signal.SIGINT))
+    path = tmp_path / "out.pcap"
+
+    main(["--transport", "fake://", "-w", str(path), *args])
+
+    data = path.read_bytes()
+    _, records = read_pcap(data)
+    values = parse_tap_record(records[0][2])
+    assert (TLV_MODEM_TIME_LO in values) == expected
+    assert (TLV_MODEM_TIME_HI in values) == expected

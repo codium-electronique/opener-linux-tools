@@ -8,7 +8,9 @@ A record is an 8-byte header, 8-byte TLV entries, then the PCC and PDC bytes:
 - header: u8 version 1, u8 0, u16 TLV chain length in bytes, u16 body length,
   u16 0;
 - TLV: u16 type, u16 value length (2 or 4), value zero-padded to 4 bytes.
-All fields are little endian.
+All fields are little endian. The format (DSRCorporation/dect-nr-tap)
+defines TLV types 1 to 9; the modem time TLVs are an Opener addition that
+Wireshark shows as unknown, written only on request.
 """
 
 import struct
@@ -19,7 +21,7 @@ TAP_VERSION = 1
 HDR_LEN = 8
 TLV_LEN = 8
 # The reference dissector rejects records shorter than 8 + 8 * 8 bytes.
-MIN_TLVS = 8
+MIN_RECORD_LEN = HDR_LEN + 8 * TLV_LEN
 
 TLV_PAD = 0
 TLV_DATA_TYPE = 1
@@ -30,6 +32,7 @@ TLV_PDC_RSSI2 = 5
 TLV_PDC_SNR = 6
 TLV_TRANSACTION_ID = 7
 TLV_CHANNEL = 8
+# Opener additions: the frame start, in modem time ticks.
 TLV_MODEM_TIME_HI = 10
 TLV_MODEM_TIME_LO = 11
 
@@ -57,8 +60,9 @@ def _metric(value: int) -> int:
     return value & 0xFFFF
 
 
-def build_tap_record(ev: MsgReceived | MsgError) -> bytes:
-    """Build the TAP record of a received frame, or of a PDC CRC error."""
+def build_tap_record(ev: MsgReceived | MsgError, modem_time: bool = False) -> bytes:
+    """Build the TAP record of a received frame, or of a PDC CRC error;
+    with modem_time, add the frame start time TLVs."""
     if isinstance(ev, MsgReceived):
         body = ev.pcc + ev.pdc
         rssi2_type = TLV_PDC_RSSI2
@@ -91,12 +95,13 @@ def build_tap_record(ev: MsgReceived | MsgError) -> bytes:
         tlvs.append(_tlv(rssi2_type, _metric(ev.rssi2), 2))
     if ev.snr is not None:
         tlvs.append(_tlv(snr_type, _metric(ev.snr), 2))
-    # The dissector combines HI with the LO entry before it: LO comes first.
-    time_lo = ev.start_time & 0xFFFFFFFF
-    time_hi = (ev.start_time >> 32) & 0xFFFFFFFF
-    tlvs.append(_tlv(TLV_MODEM_TIME_LO, time_lo, 4))
-    tlvs.append(_tlv(TLV_MODEM_TIME_HI, time_hi, 4))
-    while len(tlvs) < MIN_TLVS:
+    if modem_time:
+        time_lo = ev.start_time & 0xFFFFFFFF
+        time_hi = (ev.start_time >> 32) & 0xFFFFFFFF
+        tlvs.append(_tlv(TLV_MODEM_TIME_LO, time_lo, 4))
+        tlvs.append(_tlv(TLV_MODEM_TIME_HI, time_hi, 4))
+    # Wireshark shows padding as unknown TLVs: only as much as needed.
+    while HDR_LEN + TLV_LEN * len(tlvs) + len(body) < MIN_RECORD_LEN:
         tlvs.append(_tlv(TLV_PAD, 0, 0))
 
     chain = b"".join(tlvs)
