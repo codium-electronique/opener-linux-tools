@@ -232,7 +232,8 @@ def build_parser(extcap_mode: bool = False) -> argparse.ArgumentParser:
         required=not extcap_mode,
         default=transport_default,
         metavar="URL",
-        help="device link: uart:///dev/ttyACM0?baud=1000000 or tcp://host:port",
+        help="device link: uart:///dev/ttyACM0?baud=1000000, "
+        "spi:///dev/spidev3.0?irq=gpiochip4:0&busy=gpiochip1:1 or tcp://host:port",
     )
     parser.add_argument("--channel", type=int, default=DEFAULT_CHANNEL)
     parser.add_argument(

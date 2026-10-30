@@ -201,7 +201,7 @@ Spinel HDLC-lite: flag `0x7E`, escape `0x7D` (XOR `0x20`) for `0x7E`, `0x7D`, `0
 Spinel SPI framing (OpenThread `src/lib/spinel/spi_frame.hpp`): 5-byte header `HDR u8 | RECV_LEN u16 LE | DATA_LEN u16 LE`, followed by the raw Spinel frame (no HDLC). `HDR`: bit7 `RST`, bit6 `CRC`, bit5 `CCF`, bits1..0 pattern `0b10`. Optional CRC-16 trailer only when both sides set `CRC` (off by default).
 
 - The device keeps one `spi_transceive()` armed in slave mode (`nordic,nrf-spis`), with a TX buffer containing the header (`RECV_LEN` = its RX capacity, `DATA_LEN` = length of the pending outbound frame, or 0) and the frame.
-- **IRQ** (P0.09, active high; host side rising edge on GPIO4_A0) is asserted while an outbound frame is pending and released when a transaction carrying it completes.
+- **IRQ** (P0.09, active high; host side rising edge on GPIO4_A0) is asserted while an outbound frame is pending and released when a transaction carrying it completes. A frame that becomes pending while the slave is armed without one raises IRQ at once: the host clocks that transaction, sees `DATA_LEN` 0, and the frame is armed for the next one.
 - **BUSY** (P0.26, active high; host GPIO1_A1) is asserted while the device is not armed for a transaction (processing, re-arming). The host waits for BUSY low before clocking. BUSY is an extension to the Spinel SPI spec.
 - A frame is considered sent only if the host clocked at least `5 + DATA_LEN` bytes; otherwise it stays pending. An inbound frame is accepted only if `DATA_LEN ≤ RECV_LEN` advertised by the device. Headers with a bad pattern are ignored (counted). `RST` is set in the first header after boot.
 - IRQ polarity is active high (rising edge), unlike OpenThread's falling-edge convention; documented in `doc/spinel.rst`.
@@ -226,7 +226,7 @@ All transports exchange whole Spinel frames and are selected by URL:
 | `spi:///dev/spidev3.0?irq=gpiochip4:0&busy=gpiochip1:1&speed=8000000` | spidev + gpiod 2.x edge events, framing as §5.5 |
 | `tcp://<host>:<port>` | `nrp-hub` control port, frames as `[len u16 LE][frame]` |
 
-The SPI transport waits on IRQ edges (or a pending outbound frame), waits for BUSY low, clocks one transaction of `5 + max(outbound, device DATA_LEN, small default)` bytes, and issues a second transaction if the device's pending frame was longer than what was clocked. On the NR+Gate `/dev/spidev3.0` is obtained by binding spidev to `spi3.0` via `driver_override` (no kernel driver for `codium,nrp-spi`).
+The SPI transport waits on IRQ edges (or a pending outbound frame), waits for BUSY low, clocks one transaction of `5 + max(outbound, device DATA_LEN, small default)` bytes, and issues a second transaction if the device's pending frame was longer than what was clocked. The small default is 128 payload bytes. On the NR+Gate `/dev/spidev3.0` is obtained by binding spidev to `spi3.0` via `driver_override` (no kernel driver for `codium,nrp-spi`), done at boot by the udev rule that `scripts/nrp-gate/install.sh` installs. Measured on the NR+Gate, a request and its reply take about 3.3 ms (three transactions: the request, the one that finds the reply pending, the reply), so sniffer windows shorter than 10 ms make the host fall behind there.
 
 ### 6.2 Spinel layer
 

@@ -20,8 +20,10 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-Extras: `spi` (SPI transport: `spidev`, `gpiod` 2.x), `hub`, `dev` (tests and
-linters).
+Extras: `spi` (SPI transport: `spidev`, `gpiod` 2.x; building `spidev` needs
+the Python headers, `python3-dev`), `hub`, `dev` (tests and linters). The
+NR+Gate also needs a one-time udev setup, see
+[docs/nrp-sniffer.md](docs/nrp-sniffer.md#on-the-nrgate).
 
 To use `nrp-sniffer` from Wireshark, install it as an extcap with the venv
 active: `scripts/install-extcap.sh`.

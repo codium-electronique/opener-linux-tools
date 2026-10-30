@@ -32,7 +32,7 @@ nrp-sniffer --transport uart:///dev/ttyACM0 | wireshark -k -i -
 
 | Option | Default | |
 |---|---|---|
-| `--transport URL` | (required) | `uart:///dev/ttyACM0?baud=1000000` (1 Mbaud is the default baud rate) or `tcp://host:port` |
+| `--transport URL` | (required) | `uart:///dev/ttyACM0?baud=1000000` (1 Mbaud is the default baud rate), `spi:///dev/spidev3.0?irq=gpiochip4:0&busy=gpiochip1:1` (see [On the NR+Gate](#on-the-nrgate)) or `tcp://host:port` |
 | `--channel` | 1677 | DECT NR+ carrier number |
 | `--network-id` | `0x32545279` | 32-bit network ID, decimal or `0x` hex |
 | `--rx-mode` | `single` | `single`, `semi` or `continuous`, see below |
@@ -51,6 +51,44 @@ it exits with status 1; the file keeps the frames received until then.
 A gap is time not listened to, logged with its reason: the host fell behind
 (`resync`), the device rejected a window or did not answer (`rejected`), or
 the window failed on the device (`failed, status N`, the driver's status).
+
+## On the NR+Gate
+
+On the NR+Gate, `nrp-sniffer` runs on the gateway's Linux host and drives
+its nRF9151 over SPI. The nRF9151 runs `dectnrp-spinel` built for
+`cod_nrp_gw/nrf9151/ns`; its console and logs stay on `/dev/ttyS3`
+(115200 baud).
+
+The SPI transport needs the `spi` extra (`spidev`, `gpiod` 2.x). `spidev` is
+built at install time, so the gateway needs the Python headers:
+
+```bash
+sudo apt install python3-dev
+python3 -m venv ~/nrp-venv
+~/nrp-venv/bin/pip install -e "$HOME/linux-tools[spi]"
+```
+
+No kernel driver binds the gateway's SPI link to the nRF9151 (`spi3.0`,
+compatible `codium,nrp-spi`). Once, install the udev rule that binds it to
+spidev and lets the `gpio` group open `/dev/spidev3.0`:
+
+```bash
+sudo ~/linux-tools/scripts/nrp-gate/install.sh
+```
+
+It applies the rule without a reboot and checks that the user can open
+`/dev/spidev3.0` and the IRQ and BUSY GPIO chips. Then:
+
+```bash
+nrp-sniffer --transport 'spi:///dev/spidev3.0?irq=gpiochip4:0&busy=gpiochip1:1' -w capture.pcap
+```
+
+IRQ is GPIO4_A0 (`gpiochip4` line 0), BUSY is GPIO1_A1 (`gpiochip1` line 1);
+`speed=` sets the SPI clock (8 MHz by default, the most the link supports).
+
+A Spinel request and its reply take about 3.3 ms over this link (0.8 ms over
+the UART on a PC), so the host falls behind with windows of 5 ms: use 10 ms
+or more on the gateway.
 
 ## Wireshark extcap
 

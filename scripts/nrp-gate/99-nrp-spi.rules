@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Codium Electronique
+#
+# NR+Gate: the nRF9151 SPI link (devicetree compatible codium,nrp-spi) has
+# no kernel driver. Bind it to spidev, and let the gpio group open it.
+ACTION=="add", SUBSYSTEM=="spi", ENV{MODALIAS}=="spi:nrp-spi", ATTR{driver_override}="spidev", RUN+="/bin/sh -c 'echo %k > /sys/bus/spi/drivers/spidev/bind'"
+SUBSYSTEM=="spidev", KERNEL=="spidev3.0", GROUP="gpio", MODE="0660"
