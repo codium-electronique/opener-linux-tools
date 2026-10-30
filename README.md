@@ -1,3 +1,7 @@
+> **Archived.** These tools moved to
+> `opener-dectnrp-rs` (Rust: `nrp-sniffer`, `nrp-spi-probe`, later `nrp-hub`). This repository is
+> kept read-only as the Python reference; do not start new work here.
+
 # opener-tools
 
 Host tools for the [Opener](https://github.com/Opener-Initiative/opener) DECT NR+
