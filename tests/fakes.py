@@ -5,6 +5,9 @@
 
 import asyncio
 import dataclasses
+import errno
+import os
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 
 from opener_tools.dectnrp import DrvCaps, Event, Op, OpFinished
@@ -12,6 +15,7 @@ from opener_tools.spinel import SPINEL, SpinelCodec
 from opener_tools.spinel import dectnrp_constants as nrp
 from opener_tools.spinel.client import DeviceReset, SpinelError
 from opener_tools.spinel.dectnrp_constants import Reception
+from opener_tools.spinel.spi_frame import HEADER_LEN, build_header, parse_header
 from opener_tools.transport import Transport, TransportClosed
 
 
@@ -370,3 +374,101 @@ class DeviceTransport(FakeTransport):
     async def close(self) -> None:
         await super().close()
         await self.device.stop()
+
+
+class FakeSpiDevice:
+    """SpiIo of a device following the Spinel SPI link rules: it raises IRQ
+    while a frame is pending (a pipe stands for the edges), sends that frame
+    once a transaction clocked all of it and accepts host frames up to
+    recv_len."""
+
+    def __init__(self):
+        self.recv_len = 1300
+        self.received: list[bytes] = []
+        self.transfers: list[int] = []
+        self.edges = 0
+        self.closed = False
+        self._pending: deque[bytes] = deque()
+        self._reset = True
+        self._busy_polls = 0
+        self._garbage = False
+        self._fail = False
+        self._irq_read = -1
+        self._irq_write = -1
+
+    def queue(self, *frames: bytes) -> None:
+        """Make frames pending, raising IRQ if it was inactive."""
+        rising = not self._pending
+        self._pending.extend(frames)
+        if rising:
+            os.write(self._irq_write, b"\x01")
+            self.edges += 1
+
+    def busy_for(self, polls: int) -> None:
+        """Keep BUSY active for the next polls reads of it."""
+        self._busy_polls = polls
+
+    def garbage_next(self) -> None:
+        """Answer the next transaction as an unarmed SPIS: all 0xff."""
+        self._garbage = True
+
+    def fail_next(self) -> None:
+        """Make the next transfer raise OSError, as when the device is gone."""
+        self._fail = True
+
+    def open(self) -> None:
+        self._irq_read, self._irq_write = os.pipe()
+        os.set_blocking(self._irq_read, False)
+
+    def close(self) -> None:
+        self.closed = True
+        os.close(self._irq_read)
+        os.close(self._irq_write)
+
+    def transfer(self, data: bytes) -> bytes:
+        if self._fail:
+            self._fail = False
+            raise OSError(errno.EIO, "fake SPI device gone")
+        assert self._busy_polls == 0, "transfer while BUSY is active"
+        clocked = len(data)
+        self.transfers.append(clocked)
+        if self._garbage:
+            self._garbage = False
+            return b"\xff" * clocked
+
+        frame = b""
+        if self._pending:
+            frame = self._pending[0]
+        header = build_header(self.recv_len, len(frame), reset=self._reset)
+        answer = header + frame
+        padding = b"\xff" * max(clocked - len(answer), 0)
+        answer = answer + padding
+        if clocked >= HEADER_LEN:
+            self._reset = False
+        if frame and clocked >= HEADER_LEN + len(frame):
+            self._pending.popleft()
+
+        host = parse_header(data)
+        if host is not None and host.data_len > 0:
+            end = HEADER_LEN + host.data_len
+            if host.data_len <= self.recv_len and end <= clocked:
+                self.received.append(data[HEADER_LEN:end])
+        return answer[:clocked]
+
+    def irq_fd(self) -> int:
+        return self._irq_read
+
+    def read_irq_edges(self) -> None:
+        try:
+            os.read(self._irq_read, 64)
+        except BlockingIOError:
+            pass
+
+    def irq_active(self) -> bool:
+        return bool(self._pending)
+
+    def busy_active(self) -> bool:
+        if self._busy_polls == 0:
+            return False
+        self._busy_polls -= 1
+        return True

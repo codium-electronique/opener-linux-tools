@@ -5,6 +5,7 @@ import pytest
 
 from opener_tools import transport
 from opener_tools.transport import (
+    SpiTransport,
     TcpTransport,
     UartTransport,
     open_transport,
@@ -40,9 +41,38 @@ def test_tcp_url():
     assert transport.port == 5555
 
 
-def test_spi_url_not_implemented():
-    with pytest.raises(NotImplementedError, match="plan 3"):
-        open_transport("spi:///dev/spidev3.0?irq=gpiochip4:0")
+def test_spi_url():
+    transport = open_transport(
+        "spi:///dev/spidev3.0?irq=gpiochip4:0&busy=gpiochip1:1&speed=4000000"
+    )
+    assert isinstance(transport, SpiTransport)
+    assert transport.path == "/dev/spidev3.0"
+    assert transport.irq == ("gpiochip4", 0)
+    assert transport.busy == ("gpiochip1", 1)
+    assert transport.speed == 4_000_000
+
+
+def test_spi_url_default_speed():
+    transport = open_transport("spi:///dev/spidev3.0?irq=gpiochip4:0&busy=gpiochip1:1")
+    assert isinstance(transport, SpiTransport)
+    assert transport.speed == 8_000_000
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "spi://",
+        "spi:///dev/spidev3.0?busy=gpiochip1:1",
+        "spi:///dev/spidev3.0?irq=gpiochip4:0",
+        "spi:///dev/spidev3.0?irq=gpiochip4&busy=gpiochip1:1",
+        "spi:///dev/spidev3.0?irq=gpiochip4:x&busy=gpiochip1:1",
+        "spi:///dev/spidev3.0?irq=gpiochip4:0&busy=gpiochip1:1&mode=3",
+        "spi:///dev/spidev3.0?irq=gpiochip4:0&busy=gpiochip1:1&speed=fast",
+    ],
+)
+def test_spi_url_errors(url):
+    with pytest.raises(ValueError):
+        open_transport(url)
 
 
 @pytest.mark.parametrize(
