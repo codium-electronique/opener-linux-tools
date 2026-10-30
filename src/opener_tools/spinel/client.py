@@ -129,7 +129,8 @@ class SpinelClient:
     cannot answer a newer request. At most `max_in_flight` requests wait for
     a reply at once; the others wait for a TID. Unsolicited frames (TID 0) go to every
     subscriber queue. An unsolicited reset fails the pending requests with
-    DeviceReset and calls the on_reset callbacks.
+    DeviceReset and calls the on_reset callbacks. Losing the transport fails
+    them with TransportClosed and calls the on_close callbacks.
     """
 
     def __init__(
@@ -139,6 +140,7 @@ class SpinelClient:
         self.timeout = timeout
         self.max_in_flight = max_in_flight
         self.on_reset: list[Callable[[int], None]] = []
+        self.on_close: list[Callable[[TransportClosed], None]] = []
         self._pending: dict[int, asyncio.Future[SpinelFrame]] = {}
         self._quarantine: dict[int, float] = {}
         self._next_tid = 1
@@ -281,6 +283,11 @@ class SpinelClient:
                 self._dispatch(data)
         except TransportClosed as exc:
             self._fail_pending(exc)
+            for callback in self.on_close:
+                try:
+                    callback(exc)
+                except Exception:
+                    log.exception("on_close callback failed")
 
     def _dispatch(self, data: bytes) -> None:
         try:

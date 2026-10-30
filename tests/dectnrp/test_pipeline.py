@@ -8,7 +8,7 @@ from fakes import FakeRadio, make_caps
 
 from opener_tools.dectnrp import MsgError, MsgReceived, OpFinished, pipeline
 from opener_tools.dectnrp.pipeline import Gap, RxPipeline
-from opener_tools.spinel.client import DeviceReset, SpinelError
+from opener_tools.spinel.client import DeviceReset, SpinelError, SpinelTimeout
 from opener_tools.spinel.dectnrp_constants import Reception
 
 TIMEOUT = 0.5
@@ -405,3 +405,145 @@ async def test_slot_kept_for_fills(radio):
     # make_caps has 8 operation slots.
     with pytest.raises(ValueError):
         RxPipeline(radio, CHANNEL, 20, depth=8)
+
+
+async def test_insert_timeout_is_reject(radio):
+    rx = RxPipeline(radio, CHANNEL, 20, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+    next_start = T0 + LEAD + 2 * (WINDOW + TRANSITION)
+
+    # The reply to the insert is lost: the op may run, so skip its window.
+    radio.reject = 1
+    radio.reject_error = SpinelTimeout("no reply")
+    radio.finish(radio.scheduled[0][0])
+    await settle()
+
+    spacing = WINDOW + TRANSITION
+    assert consumer.items == [Gap(next_start, spacing, "rejected")]
+    assert starts(radio)[2] == next_start + spacing
+    consumer.task.cancel()
+
+
+async def test_fill_insert_timeout(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+
+    radio.reject = 1
+    radio.reject_error = SpinelTimeout("no reply")
+    await frame_ends(radio, radio.scheduled[0][0], 20)
+
+    assert rx.stats.fill_rejects == 1
+    assert rx.stats.gaps == 0
+    assert not consumer.task.done()
+    consumer.task.cancel()
+
+
+async def test_no_fill_over_running_window(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=3)
+    consumer = Consumer(rx)
+    await settle()
+
+    # The fill would start after the next window started: that window
+    # covers the time, a fill would overlap it.
+    await frame_ends(radio, radio.scheduled[0][0], 185)
+
+    assert len(radio.scheduled) == 4
+    assert rx.stats.fills == 0
+    consumer.task.cancel()
+
+
+# nRF91 op completion error NRF_MODEM_DECT_PHY_ERR_OP_START_TIME_LATE,
+# negated by the driver.
+START_TIME_LATE = -0x1000
+
+
+async def test_failed_window_is_gap(radio):
+    rx = RxPipeline(radio, CHANNEL, 20, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+    first = radio.scheduled[0][0]
+
+    radio.finish(first, START_TIME_LATE)
+    await settle()
+
+    assert consumer.items == [Gap(T0 + LEAD, WINDOW, "failed, status -4096")]
+    assert rx.stats.gaps == 1
+    assert rx.stats.gap_ticks == WINDOW
+    # The grid goes on.
+    assert len(radio.scheduled) == 3
+    consumer.task.cancel()
+
+
+async def test_failed_fill_counted(radio):
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+    await frame_ends(radio, radio.scheduled[0][0], 20)
+    fill = radio.scheduled[2][0]
+
+    radio.finish(fill, START_TIME_LATE)
+    await settle()
+
+    assert rx.stats.fill_rejects == 1
+    assert rx.stats.gaps == 0
+    assert consumer.items == [received(radio.scheduled[0][0])]
+    consumer.task.cancel()
+
+
+async def run_windows(radio, seconds):
+    """Let the modem clock run for seconds, each window finishing at its
+    end."""
+    end = radio.clock + round(seconds * TICKS_PER_MS * 1000)
+    while radio.clock < end:
+        pending = [entry for entry in radio.scheduled if entry[0].token in radio._pending]
+        op, start, duration, _ = min(pending, key=lambda entry: entry[1])
+        radio.clock = start + duration
+        radio.finish(op)
+        await settle()
+
+
+def drifting_host(monkeypatch, radio, rate):
+    """The host clock runs rate times as fast as the modem clock."""
+    ticks_per_s = TICKS_PER_MS * 1000
+
+    def host_time():
+        return radio.clock * rate / ticks_per_s
+
+    monkeypatch.setattr(pipeline, "monotonic", host_time)
+
+
+async def test_reanchored_when_host_fast(radio, monkeypatch):
+    drifting_host(monkeypatch, radio, 1.01)
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+
+    # Without a new anchor, the host would see the windows as late after
+    # about 20 s.
+    await run_windows(radio, 40)
+
+    assert rx.stats.gaps == 0
+    consumer.task.cancel()
+
+
+async def test_fill_start_when_host_slow(radio, monkeypatch):
+    drifting_host(monkeypatch, radio, 0.999)
+    rx = RxPipeline(radio, CHANNEL, 200, depth=2)
+    consumer = Consumer(rx)
+    await settle()
+    await run_windows(radio, 30)
+    pending = [entry for entry in radio.scheduled if entry[0].token in radio._pending]
+    window = min(pending, key=lambda entry: entry[1])
+
+    # Without a new anchor, the host would be 30 ms behind: the fill would
+    # start 10 ms in the past.
+    await frame_ends(radio, window[0], 20)
+
+    fills = [entry for entry in radio.scheduled if entry[2] != LONG]
+    _, start, _, _ = fills[0]
+    error = start - (radio.clock + LEAD)
+    assert abs(error) <= TICKS_PER_MS
+    assert rx.stats.fills == 1
+    consumer.task.cancel()

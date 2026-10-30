@@ -18,6 +18,7 @@ from opener_tools.spinel.client import (
     is_reset_status,
 )
 from opener_tools.spinel.dectnrp_constants import Reception
+from opener_tools.transport import TransportClosed
 
 from .events import Event, OpFinished, decode_event
 from .timing import Timing
@@ -122,7 +123,8 @@ class Radio:
     unsolicited frames from a task, routes each event to its Op and to the
     events() streams, and fails the pending Ops when the device resets. Reset
     notifications come in the same stream as the events, so the events sent
-    before a reset reach their Op first.
+    before a reset reach their Op first. When the transport is lost, the
+    pending Ops and the events() streams raise TransportClosed.
     """
 
     def __init__(self, client: SpinelClient):
@@ -130,10 +132,11 @@ class Radio:
         self.caps: DrvCaps | None = None
         self._ops: dict[int, Op] = {}
         self._next_token = 1
-        self._streams: list[asyncio.Queue[Event]] = []
+        self._streams: list[asyncio.Queue[Event | TransportClosed]] = []
         self._frames = client.subscribe()
         self._reset_seen = asyncio.Event()
         self._router = asyncio.create_task(self._route())
+        client.on_close.append(self._on_close)
 
     async def close(self) -> None:
         self._router.cancel()
@@ -142,6 +145,7 @@ class Radio:
         except asyncio.CancelledError:
             pass
         self.client.unsubscribe(self._frames)
+        self.client.on_close.remove(self._on_close)
 
     async def init(self) -> DrvCaps:
         """Check the device identity and read its capabilities."""
@@ -250,15 +254,17 @@ class Radio:
 
         The stream receives the events from this call on.
         """
-        queue: asyncio.Queue[Event] = asyncio.Queue()
+        queue: asyncio.Queue[Event | TransportClosed] = asyncio.Queue()
         self._streams.append(queue)
         return self._stream(queue)
 
-    async def _stream(self, queue: asyncio.Queue[Event]) -> AsyncIterator[Event]:
+    async def _stream(self, queue: asyncio.Queue[Event | TransportClosed]) -> AsyncIterator[Event]:
         try:
             while True:
-                event = await queue.get()
-                yield event
+                item = await queue.get()
+                if isinstance(item, TransportClosed):
+                    raise item
+                yield item
         finally:
             self._streams.remove(queue)
 
@@ -325,6 +331,11 @@ class Radio:
             op._add(event)
         for queue in self._streams:
             queue.put_nowait(event)
+
+    def _on_close(self, exc: TransportClosed) -> None:
+        self._fail_ops(exc)
+        for queue in self._streams:
+            queue.put_nowait(exc)
 
     def _fail_ops(self, exc: Exception) -> None:
         ops = list(self._ops.values())

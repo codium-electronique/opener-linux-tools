@@ -237,7 +237,7 @@ Vendored pyspinel subset: codec (`encode_fields` / `parse_fields`, packed uint),
 - `Radio(client)`: `reset()`, `enable(bool)`, `caps()`, `time()`, `set_network_id()`, `set_filter_*()`, `stats()`, `schedule_rx()`, `schedule_tx()`, `schedule_rssi1()`, `events()` (async iterator of all events).
 - `schedule_*()` allocate a token and return an `Op`, an awaitable that completes on `OP_FINISHED` and exposes the events received for that token.
 - Timing helpers derived from `DRV_CAPS`: modem ticks per symbol / subslot / slot / frame; ms ↔ ticks.
-- `RxPipeline(radio, channel, window, depth=3, reception=…)`: reads `DRV_TIME`, schedules `depth` RX windows back to back (`start = previous start + duration + scheduled-op transition`), schedules a new one on each `OP_FINISHED`, and yields received / error events. In single-shot mode, a window ended early by a frame (received or PDC CRC error) gets a fill window from now + lead up to the next queued window, minus the transition, if that is 1 ms or more; fills are not counted in `depth` (one op slot is kept for them) and do not extend the queue, and a rejected fill is counted, not resynced. The transition at each window boundary is blind (measured on nRF9131: about 0.7 ms per boundary), so the default window is long (200 ms) and fills keep it from leaving the rest of a window unheard. If the device rejects an op or a window would start in the past, it resyncs from `DRV_TIME` and reports the coverage gap (start, length).
+- `RxPipeline(radio, channel, window, depth=3, reception=…)`: reads `DRV_TIME`, schedules `depth` RX windows back to back (`start = previous start + duration + scheduled-op transition`), schedules a new one on each `OP_FINISHED`, and yields received / error events. In single-shot mode, a window ended early by a frame (received or PDC CRC error) gets a fill window from now + lead up to the first queued window, minus the transition, if that is 1 ms or more; fills are not counted in `depth` (one op slot is kept for them) and do not extend the queue, and a rejected fill is counted, not resynced. The transition at each window boundary is blind (measured on nRF9131: about 0.7 ms per boundary), so the default window is long (200 ms) and fills keep it from leaving the rest of a window unheard. If the device rejects an op, does not answer its insert, or a window would start in the past, it resyncs from `DRV_TIME` and reports the coverage gap (start, length). A window whose `OP_FINISHED` carries a non-zero status (start time late, scheduling conflict…) is reported as a gap too; a failed fill is counted with the rejected ones. The host's estimate of the modem time is read again from `DRV_TIME` when older than 1 s, since the two clocks drift apart.
 
 ### 6.4 Capture (`capture/`)
 
@@ -257,10 +257,11 @@ DECT NR TAP record builder and libpcap writer (link type 304), derived from the 
 | Situation | Behaviour |
 |---|---|
 | Device reboot | Host sees unsolicited `RESET_POWER_ON`; client fails in-flight ops with `DeviceReset`; tools re-initialise or exit (`nrp-sniffer`: re-init and continue, logging a gap). |
-| Request timeout | Client raises `Timeout`; tools retry idempotent gets, abort on op inserts after resync. |
+| Request timeout | Client raises `Timeout`; `RxPipeline` handles an op insert without reply as a rejected op (skip the window, resync); other requests abort. |
 | Event drops on device | `dropped` field and `DRV_STATS`; sniffer logs and counts. |
 | Link errors (FCS, bad SPI header) | Counted on both sides; frame dropped; requests recovered by timeout/retry. |
 | Pipeline falls behind | `RxPipeline` resync from `DRV_TIME`, gap reported. |
+| Transport lost (device unplugged) | Client fails in-flight requests, `Radio` its Ops and event streams, with `TransportClosed`; `nrp-sniffer` exits 1. |
 | Second controller connects to hub | Refused with an error message; monitors unaffected. |
 
 ## 8. Testing

@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from time import monotonic
 
-from opener_tools.spinel.client import SpinelError
+from opener_tools.spinel.client import SpinelError, SpinelTimeout
 from opener_tools.spinel.dectnrp_constants import Reception
 
 from .events import Event, MsgError, MsgReceived, OpFinished
@@ -16,6 +16,9 @@ from .radio import Op, Radio
 
 # Shorter fill windows are not worth an operation.
 FILL_MIN_MS = 1.0
+# The host and modem clocks drift apart (tens of ppm): the modem time is read
+# again when the last reading is older than this.
+ANCHOR_MAX_AGE_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -59,15 +62,17 @@ class RxPipeline:
     one more each time a window finishes. It yields the MsgReceived and
     MsgError events of its windows in arrival order, and a Gap each time it
     has to skip ahead: when the next window would start too late
-    ("resync"), or when the device rejects it ("rejected"). A DeviceReset
-    ends the iteration.
+    ("resync"), or when the device rejects it or does not answer
+    ("rejected"). A window whose operation fails on the device (start time
+    late, scheduling conflict...) is yielded as a Gap too ("failed, status
+    N"). A DeviceReset or a lost transport ends the iteration.
 
     Consecutive windows are separated by the device's sched_op_transition,
     since the modem rejects exactly adjacent windows (1 ms if unknown).
 
     In single-shot mode a frame ends its window early. The pipeline then
     schedules a fill window over the rest of it: from lead after now up to
-    the next queued window, if that leaves FILL_MIN_MS at least. A fill
+    the first queued window, if that leaves FILL_MIN_MS at least. A fill
     ended by a frame gets a fill in turn; fills do not extend the queue.
     One operation slot is kept for them.
     """
@@ -151,8 +156,13 @@ class RxPipeline:
                     if window.received and single_shot:
                         self.stats.early_finishes += 1
                         await self._schedule_fill()
+                    failed = event.status != 0
                     if window.fill:
+                        if failed:
+                            self.stats.fill_rejects += 1
                         continue
+                    if failed:
+                        yield self._failed(window, event.status)
                     gaps = await self._schedule_next()
                     for gap in gaps:
                         yield gap
@@ -188,9 +198,18 @@ class RxPipeline:
         self._modem_anchor = await self.radio.time()
         self._host_anchor = monotonic()
 
-    def _now_estimate(self) -> int:
+    async def _now_estimate(self) -> int:
         elapsed = monotonic() - self._host_anchor
+        if elapsed > ANCHOR_MAX_AGE_S:
+            await self._sync()
+            elapsed = 0.0
         return self._modem_anchor + round(elapsed * self._ticks_per_s)
+
+    def _failed(self, window: _Window, status: int) -> Gap:
+        gap = Gap(window.start, self._window, f"failed, status {status}")
+        self.stats.gaps += 1
+        self.stats.gap_ticks += gap.length
+        return gap
 
     async def _resync(self, reason: str, earliest: int) -> Gap:
         """Move the next start to now + lead, or to earliest if later."""
@@ -210,15 +229,17 @@ class RxPipeline:
         async with self._schedule_lock:
             if self._stopping:
                 return gaps
-            deadline = self._now_estimate() + self._lead // 2
+            now = await self._now_estimate()
+            deadline = now + self._lead // 2
             if self._next_start < deadline:
                 gap = await self._resync("resync", self._next_start)
                 gaps.append(gap)
             try:
                 op = await self._insert()
-            except SpinelError:
+            except (SpinelError, SpinelTimeout):
                 # Skip the rejected window: an earlier start would overlap
-                # the windows already queued.
+                # the windows already queued. Without a reply, the device may
+                # run it: its events have an unknown token.
                 skipped = self._next_start + self._spacing
                 gap = await self._resync("rejected", skipped)
                 gaps.append(gap)
@@ -228,20 +249,20 @@ class RxPipeline:
         return gaps
 
     async def _schedule_fill(self) -> None:
-        """Schedule a window from lead after now up to the next queued one."""
+        """Schedule a window from lead after now up to the first queued one."""
         async with self._schedule_lock:
-            start = self._now_estimate() + self._lead
+            now = await self._now_estimate()
+            start = now + self._lead
             # The next window is either queued or the next one to queue;
-            # when stopping, only a queued one, so the drain is no longer.
-            end = None
+            # when stopping, only a queued one, so the drain is no longer. A
+            # queued window starting before the fill would has started or is
+            # about to: it covers that time, a fill would overlap it.
+            ends = [window.start for window in self._windows.values()]
             if not self._stopping:
-                end = self._next_start
-            for window in self._windows.values():
-                is_later = window.start >= start
-                if is_later and (end is None or window.start < end):
-                    end = window.start
-            if end is None:
+                ends.append(self._next_start)
+            if not ends:
                 return
+            end = min(ends)
             duration = end - self._transition - start
             if duration < self._fill_min:
                 return
@@ -249,7 +270,7 @@ class RxPipeline:
                 op = await self.radio.schedule_rx(
                     self.channel, duration, start=start, reception=self.reception
                 )
-            except SpinelError:
+            except (SpinelError, SpinelTimeout):
                 # The rest of the window stays uncovered, as without fills.
                 self.stats.fill_rejects += 1
                 return

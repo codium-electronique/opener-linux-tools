@@ -11,6 +11,7 @@ from opener_tools.spinel import SPINEL, SpinelCodec
 from opener_tools.spinel import dectnrp_constants as nrp
 from opener_tools.spinel.client import DeviceReset, SpinelClient, SpinelError
 from opener_tools.spinel.dectnrp_constants import Reception
+from opener_tools.transport import TransportClosed
 
 TIMEOUT = 0.5
 
@@ -239,3 +240,15 @@ async def test_events_stream(radio, device):
     second = await asyncio.wait_for(anext(events), TIMEOUT)
     assert first.token == op.token
     assert second.token == 999
+
+
+async def test_transport_closed_fails_ops(radio, device):
+    events = radio.events()
+    op = await radio.schedule_rx(channel=1677, duration=691200)
+
+    await device.transport.close()
+
+    with pytest.raises(TransportClosed):
+        await asyncio.wait_for(op, TIMEOUT)
+    with pytest.raises(TransportClosed):
+        await asyncio.wait_for(anext(events), TIMEOUT)

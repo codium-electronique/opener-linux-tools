@@ -27,6 +27,10 @@ class FakeTransport(Transport):
     def inject(self, frame: bytes) -> None:
         self._received.put_nowait(frame)
 
+    def inject_closed(self) -> None:
+        """Make recv() raise TransportClosed, as when the device is unplugged."""
+        self._received.put_nowait(None)
+
     async def open(self) -> None:
         self.closed = False
 
@@ -151,13 +155,15 @@ class FakeRadio:
 
     schedule_rx records (op, start, duration, reception) in scheduled and
     returns an Op the test feeds with emit() and finish(). It raises
-    SpinelError while reject is non-zero, decrementing it.
+    reject_error (a SpinelError by default) while reject is non-zero,
+    decrementing it.
     """
 
     def __init__(self, caps: DrvCaps):
         self.caps = caps
         self.clock = 0
         self.reject = 0
+        self.reject_error: Exception = SpinelError(SPINEL.STATUS_FAILURE)
         self.scheduled: list[tuple[Op, int | None, int, Reception]] = []
         self._next_token = 1
         self._pending: dict[int, Op] = {}
@@ -175,7 +181,7 @@ class FakeRadio:
     ) -> Op:
         if self.reject > 0:
             self.reject -= 1
-            raise SpinelError(SPINEL.STATUS_FAILURE)
+            raise self.reject_error
         token = self._next_token
         self._next_token += 1
         op = Op(token)
@@ -197,8 +203,8 @@ class FakeRadio:
         for queue in self._streams:
             queue.put_nowait(event)
 
-    def finish(self, op: Op) -> None:
-        self.emit(OpFinished(op.token, 0, 0))
+    def finish(self, op: Op, status: int = 0) -> None:
+        self.emit(OpFinished(op.token, status, 0))
 
     def device_reset(self, status: int = SPINEL.STATUS_RESET_POWER_ON) -> None:
         ops = list(self._pending.values())

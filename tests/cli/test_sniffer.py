@@ -21,6 +21,7 @@ from opener_tools.cli.sniffer import main, run_sniffer
 from opener_tools.spinel import SPINEL, SpinelCodec
 from opener_tools.spinel import dectnrp_constants as nrp
 from opener_tools.spinel.dectnrp_constants import Reception
+from opener_tools.transport import TransportClosed
 
 TIMEOUT = 5.0
 TICKS_PER_MS = 69120
@@ -186,6 +187,28 @@ async def test_clean_stop(device, tmp_path):
     assert len(device.ops) == 6
     assert device.requests[-1] == DISABLE
     assert device.running_at_disable == 0
+    assert out.closed
+
+
+async def test_transport_lost(device, tmp_path):
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def unplug():
+        device._abort_ops()
+        device.transport.inject_closed()
+
+    def after_insert(count):
+        if count == 6:
+            loop.call_soon(unplug)
+            # Ctrl-C after the device is gone.
+            loop.call_later(0.1, stop.set)
+
+    device.after_insert = after_insert
+    out = (tmp_path / "out.pcap").open("wb")
+
+    with pytest.raises(TransportClosed):
+        await sniff(out, stop)
     assert out.closed
 
 

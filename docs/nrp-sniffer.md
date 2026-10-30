@@ -45,7 +45,12 @@ nrp-sniffer --transport uart:///dev/ttyACM0 | wireshark -k -i -
 The channel and network ID defaults are those of the `dectnrp-driver` sample.
 
 If the device resets during a capture, `nrp-sniffer` logs it, initialises the
-device again and goes on in the same file.
+device again and goes on in the same file. If the device is lost (unplugged),
+it exits with status 1; the file keeps the frames received until then.
+
+A gap is time not listened to, logged with its reason: the host fell behind
+(`resync`), the device rejected a window or did not answer (`rejected`), or
+the window failed on the device (`failed, status N`, the driver's status).
 
 ## Wireshark extcap
 
