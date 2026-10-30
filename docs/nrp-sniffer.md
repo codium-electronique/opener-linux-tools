@@ -104,8 +104,12 @@ After a frame, the 20 ms until its fill window starts are not listened to
 either: a second frame within 20 ms of the first is missed.
 
 Windows of 3 ms or less are too short for the UART link: the host falls behind
-(the resyncs are logged as gaps), then an op insert gets no reply and the
-capture stops. Use 5 ms or more.
+and resyncs, losing the time logged as gaps. Use 5 ms or more.
+
+The UART link needs hardware flow control on the device (the `dectnrp-spinel`
+sample enables it on the DK and the EK). Without it, the device loses about
+one request in 4000 at 1 Mbaud, and the capture stops on a request with no
+reply.
 
 ## Records
 
