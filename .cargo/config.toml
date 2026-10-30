@@ -1,0 +1,10 @@
+# Cross build for the NR+Gate (RK3566, aarch64, glibc). With --target
+# aarch64-unknown-linux-gnu, cargo run and cargo test run the binary on the
+# gateway through scripts/gateway-run.sh; native builds are unchanged.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+runner = "scripts/gateway-run.sh"
+
+[alias]
+gw = "run --release --target aarch64-unknown-linux-gnu"
+gw-test = "test --target aarch64-unknown-linux-gnu"

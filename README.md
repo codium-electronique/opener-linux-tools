@@ -41,6 +41,24 @@ active: `scripts/install-extcap.sh`.
 - `src/opener_tools/capture/`: DECT-NR-TAP records, pcap writer, Wireshark
   extcap interface.
 - `src/opener_tools/cli/`: command-line tools.
+- `crates/`: Rust tools, in one Cargo workspace. `nrp-spi-probe` checks the
+  NR+Gate SPI link and times Spinel round trips.
+
+## Rust tools
+
+Cross-built on the PC for the NR+Gate (aarch64, glibc), with the
+`aarch64-unknown-linux-gnu` rustup target and the `gcc-aarch64-linux-gnu`
+linker. No kernel headers or target libraries are needed. With that target,
+`cargo run` and `cargo test` copy the binary to the gateway and run it there
+(`scripts/gateway-run.sh`; `NRP_GATEWAY` overrides `codium@172.16.1.134`):
+
+```bash
+rustup target add aarch64-unknown-linux-gnu
+sudo apt install gcc-aarch64-linux-gnu
+cargo test                          # unit tests, on the PC
+cargo gw -p nrp-spi-probe           # release build, run on the gateway
+cargo gw-test                       # unit tests, on the gateway
+```
 
 ## Tests
 
@@ -48,6 +66,8 @@ active: `scripts/install-extcap.sh`.
 .venv/bin/pytest
 .venv/bin/ruff check
 .venv/bin/ruff format --check
+cargo fmt --check
+cargo clippy --all-targets
 ```
 
 `tests/spinel/test_constants.py` checks the DECT NR+ identifiers against the C
